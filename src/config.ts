@@ -12,6 +12,7 @@ import { validateMemoryFieldDefinitions, CORE_MEMORY_FIELDS, type MemoryFieldDef
 import { validateBrowserConfig, type BrowserConfig } from './tools/public-browser.js';
 import type { ScheduleOptions } from './scheduled-tasks/types.js';
 import { validateAgentPlugins, type AgentPluginSpec } from './runtime/plugins.js';
+import { resolveRouterCompactionSettings, type RouterCompactionSettings } from './runtime/router-compaction-policy.js';
 
 export interface SharedMemoryConfig {
   fields?:MemoryFieldDefinition[];
@@ -49,6 +50,7 @@ export interface Config {
   routerTimeoutMs: number;
   routerTurnTimeoutMs?:number;
   routerQueueTimeoutMs?:number;
+  routerCompaction?:RouterCompactionSettings;
   routerContextChars: number;
   routerSessionMaxBytes:number;
   persistentRouter?:boolean;
@@ -105,6 +107,7 @@ export function reloadAgentConfig(initial:Config):{config:Config;revision:string
   const config:Config={...initial,
     router:modelDefaults('router',disk.router??initial.router),worker:modelDefaults('worker',disk.worker??initial.worker),
     providers:disk.providers??initial.providers,
+    routerCompaction:resolveRouterCompactionSettings(disk.routerCompaction===undefined?initial.routerCompaction:disk.routerCompaction),
     business:disk.business??initial.business,
     skills:disk.skills===undefined?initial.skills:disk.skills.map((s:SkillSpec)=>({...s,path:localPath(s.path)})),
     extensions:disk.extensions??initial.extensions,
@@ -144,6 +147,7 @@ export function loadConfig(root = process.cwd(), overrides: Partial<Config> = {}
     routerTimeoutMs: disk.routerTimeoutMs ?? 30_000,
     routerTurnTimeoutMs: disk.routerTurnTimeoutMs ?? 120_000,
     routerQueueTimeoutMs: disk.routerQueueTimeoutMs ?? 180_000,
+    routerCompaction:resolveRouterCompactionSettings(disk.routerCompaction),
     routerContextChars: disk.routerContextChars ?? 48_000,
     routerSessionMaxBytes: disk.routerSessionMaxBytes ?? 4_000_000,
     persistentRouter: disk.persistentRouter ?? false,
@@ -194,6 +198,7 @@ export function loadConfig(root = process.cwd(), overrides: Partial<Config> = {}
   validateCapabilities(config.skills,config.extensions);
   validateMemoryFieldDefinitions(config.memory?.fields??[]);
   validateBusinessReferences(config);validateModels(config);
+  config.routerCompaction=resolveRouterCompactionSettings(config.routerCompaction);
   for(const key of ['routerTurnTimeoutMs','routerQueueTimeoutMs'] as const)if(!Number.isSafeInteger(config[key])||config[key]!<=0)throw new Error(`Invalid ${key}`);
   if(typeof config.persistentRouter!=='boolean')throw new Error('Invalid persistentRouter');
   if(!Array.isArray(config.botCallNames)||config.botCallNames.length>32||config.botCallNames.some(name=>typeof name!=='string'||!name.trim()||name!==name.trim()||name.length>80))throw new Error('Invalid botCallNames');

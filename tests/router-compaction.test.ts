@@ -55,8 +55,8 @@ describe('Router compaction',()=>{
     await agent.send(oldHistory);
     const correction='Current host: player-A changed budget to 10元; only qq:bot:room:new is actionable.';
     const result=await agent.send(correction);
-    expect(policy).toMatchObject({maxTokens:16384,headroomTokens:16384,retainTokens:8000});
-    expect(policy).not.toHaveProperty('retainRatio');
+    expect(policy).toMatchObject({maxTokens:16384,thresholdRatio:0.8,headroomTokens:65536,retainRatio:0.16});
+    expect(policy).not.toHaveProperty('retainTokens');
     expect(adapter.summaries).toHaveLength(1);
     const request=adapter.summaries[0];
     expect(request).toMatchObject({provider:'mock',model:'summary-current',maxTokens:16384,sessionId:'router-room',purpose:'compaction'});
@@ -66,6 +66,7 @@ describe('Router compaction',()=>{
     expect(request.messages[0].content).toEqual([{type:'text',text:expect.stringContaining('Router must output action JSON.')}]);
     expect(request.messages[0].content).toEqual([{type:'text',text:expect.stringContaining('用户明确要求记住的代号、名字、数字及单位等必须在摘要中逐字保留')}]);
     expect(request.messages.slice(1).some(message=>message.role==='system')).toBe(false);
+    expect(request.messages.at(-1)?.content).toEqual([{type:'text',text:ROUTER_COMPACTION_INSTRUCTION}]);
     expect(JSON.stringify(request.messages)).not.toContain('AI coding assistant');
     expect(result.compaction).toMatchObject({summaries:1,inputTokens:17,outputTokens:5});
     expect(result.usage).toEqual({inputTokens:34,outputTokens:10});
@@ -97,7 +98,7 @@ describe('Router compaction',()=>{
     expect(events.some(event=>event.type==='compaction/end'&&event.data.error)).toBe(true);
   });
 
-  it('recovers truncation once with a shorter policy, accounts for both calls, and commits only the complete summary',async()=>{
+  it('recovers truncation once with a consolidation instruction, accounts for both calls, and commits only the complete summary',async()=>{
     let calls=0;
     const adapter=new Adapter(()=>++calls===1
       ?[...response('discard this truncated partial checkpoint').slice(0,-1),{type:'finish',reason:{kind:'max-tokens'}}]
@@ -110,7 +111,7 @@ describe('Router compaction',()=>{
     expect(adapter.summaries.map(request=>request.maxTokens)).toEqual([16384,16384]);
     expect(JSON.stringify(adapter.summaries[0].messages)).not.toContain(ROUTER_COMPACTION_RETRY_INSTRUCTION);
     expect(adapter.summaries[1].messages[0].content).toEqual([{type:'text',text:expect.stringContaining(ROUTER_COMPACTION_RETRY_INSTRUCTION)}]);
-    expect(adapter.summaries[1].messages[0].content).toEqual([{type:'text',text:expect.stringContaining('改用严格短摘要策略')}]);
+    expect(adapter.summaries[1].messages.at(-1)?.content).toEqual([{type:'text',text:expect.stringContaining(ROUTER_COMPACTION_RETRY_INSTRUCTION)}]);
     expect(JSON.stringify(adapter.summaries[1].messages)).not.toContain('discard this truncated');
     expect(adapter.summaries.every(request=>request.reasoningEffort===undefined)).toBe(true);
     expect(result.compaction).toMatchObject({summaries:1,inputTokens:34,outputTokens:10});
@@ -174,7 +175,7 @@ describe('Router compaction',()=>{
         setup(ctx){policy=(ctx.get('compaction') as BasicCompaction|undefined)?.config;}});
       await agent.send(oldHistory);
       if(role==='router'){
-        expect(policy).toMatchObject({maxTokens:16384,retainTokens:8000});
+        expect(policy).toMatchObject({maxTokens:16384,thresholdRatio:0.8,headroomTokens:65536,retainRatio:0.16});
         await agent.send('Continue with the current request.');
         expect(adapter.summaries).toHaveLength(1);
         expect(adapter.summaries[0].messages[0].content).toEqual([{type:'text',text:expect.stringContaining(ROUTER_COMPACTION_INSTRUCTION)}]);
@@ -218,9 +219,78 @@ describe('Router compaction',()=>{
     expect(auxiliary).toBeDefined();
     expect(['system','developer']).toContain(auxiliary!.messages[0].role);
     expect(auxiliary!.messages[0].content).toContain('Router must output action JSON.');
-    expect(auxiliary!.messages.slice(1).some(message=>message.content.includes(ROUTER_COMPACTION_INSTRUCTION))).toBe(false);
+    expect(auxiliary!.messages.at(-1)?.role).toBe('user');
+    expect(auxiliary!.messages.at(-1)?.content).toBe(ROUTER_COMPACTION_INSTRUCTION);
     expect(auxiliary!.max_tokens??auxiliary!.max_completion_tokens).toBe(16384);
     expect(JSON.stringify(requests.at(-1))).toContain(summary);
+  });
+
+  it('honors explicit summary budgets through the model-aware pool and retires old policies on reload',async()=>{
+    const directory=await root(),adapter=new Adapter(),create=NativeAgentRuntime.create.bind(NativeAgentRuntime);
+    vi.spyOn(NativeAgentRuntime,'create').mockImplementation(options=>create({...options,providers:undefined,adapters:{'boe-router':adapter}}));
+    const config=loadConfig(directory,{routerApiKey:'test-router',routerCompaction:{maxTokens:3072}}),pool=new NativeRuntimePool(directory);
+    cleanup.push(()=>pool.close());
+    const first=await pool.acquire('router',config);
+    let original:BasicCompaction['config']|undefined;
+    const agent=await first.native.start({id:'budget-original',model:{...first.model,reasoningEffort:undefined},cwd:directory,systemPrompt:'Router',maxContextChars:12_000,
+      setup(ctx){original=(ctx.get('compaction') as BasicCompaction).config;}});
+    await agent.send(oldHistory);await agent.send('Keep the current input.');
+    expect(adapter.summaries[0].maxTokens).toBe(3072);
+    const second=await pool.acquire('router',{...config,routerCompaction:{maxTokens:1536,thresholdTokens:96000,contextTokens:128000,headroomTokens:16384}});
+    expect(second.native).not.toBe(first.native);
+    let nextPolicy:BasicCompaction['config']|undefined;
+    const updated=await second.native.start({id:'budget-updated',model:{...second.model,reasoningEffort:undefined},cwd:directory,systemPrompt:'Router',maxContextChars:12_000,
+      setup(ctx){nextPolicy=(ctx.get('compaction') as BasicCompaction).config;}});
+    await updated.send(oldHistory);await updated.send('Keep the new input.');
+    expect(adapter.summaries[1].maxTokens).toBe(1536);
+    expect(original?.maxTokens).toBe(3072);
+    expect(original?.thresholdRatio).toBe(0.8);
+    expect(nextPolicy?.thresholdRatio).toBe(96000/1_000_000);
+    await agent.dispose();await updated.dispose();await first.release();await second.release();
+  });
+
+  it('clamps an explicit summary budget to the resolved model capacity',async()=>{
+    class SmallAdapter extends Adapter {
+      override async resolveModel(provider:string,model:string):Promise<LlmResolvedModelInfo>{
+        return {provider,id:model,name:model,context:{contextWindow:32_000},defaultMaxTokens:5000};
+      }
+    }
+    const {runtime,directory}=await mount(new SmallAdapter(),{compactionModel:{provider:'mock',model:'small',maxTokens:1200},routerCompaction:{headroomTokens:4096},compaction:{...ROUTER_COMPACTION_POLICY,maxTokens:16_384}});
+    let policy:BasicCompaction['config']|undefined;
+    const agent=await runtime.start({id:'small-summary',model:{provider:'mock',model:'small'},cwd:directory,systemPrompt:'Router',
+      setup(ctx){policy=(ctx.get('compaction') as BasicCompaction).config;}});
+    expect(policy?.maxTokens).toBe(5000);
+    expect(policy?.headroomTokens).toBe(4096);
+    expect(policy?.retainRatio).toBe(0.16);
+    await agent.dispose();
+  });
+
+  it('does not compact at the old 48k limit when the model has room under the official policy',async()=>{
+    class UsageAdapter extends Adapter {
+      override async *stream(request:GenerateOptions):AsyncIterable<StreamChunk>{
+        this.requests.push(request);
+        for(const chunk of response('Still within the model working set.'))
+          yield chunk.type==='usage'?{type:'usage',usage:{inputTokens:100000,outputTokens:10}}:chunk;
+      }
+    }
+    const adapter=new UsageAdapter(),{runtime,directory}=await mount(adapter,{compactionModel:{provider:'mock',model:'large',maxTokens:8192}});
+    const agent=await runtime.start({id:'official-window',model:{provider:'mock',model:'large',maxTokens:8192},cwd:directory,systemPrompt:'Router',
+      maxContextTokens:1_000_000,maxContextBytes:4_000_000});
+    await agent.send(oldHistory);await agent.send('Continue from the recent input.');
+    expect(adapter.summaries).toHaveLength(0);
+    expect(adapter.main).toHaveLength(2);
+    expect(JSON.stringify(adapter.main[1].messages)).toContain(oldHistory);
+    await agent.dispose();
+  });
+
+  it('requires explicit headroom for a small model instead of silently changing the official defaults',async()=>{
+    class SmallAdapter extends Adapter {
+      override async resolveModel(provider:string,model:string):Promise<LlmResolvedModelInfo>{
+        return {provider,id:model,name:model,context:{contextWindow:32_000}};
+      }
+    }
+    await expect(mount(new SmallAdapter(),{compactionModel:{provider:'mock',model:'small',maxTokens:1200}}))
+      .rejects.toThrow('routerCompaction.headroomTokens');
   });
 });
 

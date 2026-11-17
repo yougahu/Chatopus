@@ -88,6 +88,27 @@ it('loads and validates the Router history character budget',()=>{
   }
 });
 
+it('reloads the independent summary budget and rejects invalid settings',()=>{
+  const root=directory(),initial=loadConfig(root);
+  expect(initial.routerCompaction).toEqual({maxTokens:16384,thresholdRatio:0.8,headroomTokens:65536,retainRatio:0.16});
+  const supplied=loadConfig(root,{routerCompaction:{maxTokens:3072,thresholdTokens:96000,contextTokens:128000}});
+  expect(reloadAgentConfig(supplied).config.routerCompaction).toEqual(supplied.routerCompaction);
+  disk(root,{routerCompaction:{maxTokens:3072}});
+  expect(loadConfig(root).routerCompaction).toMatchObject({maxTokens:3072,thresholdRatio:0.8,headroomTokens:65536,retainRatio:0.16});
+  expect(reloadAgentConfig(initial).config.routerCompaction).toMatchObject({maxTokens:3072});
+  expect(reloadAgentConfig(initial).config.router).toEqual(initial.router);
+  disk(root,{});
+  expect(reloadAgentConfig(initial).config.routerCompaction).toEqual(initial.routerCompaction);
+  disk(root,{routerCompaction:{thresholdTokens:96000,contextTokens:128000}});
+  expect(reloadAgentConfig(initial).config.routerCompaction).toMatchObject({thresholdTokens:96000,contextTokens:128000});
+  for(const value of [null,[],false,{maxTokens:0},{maxTokens:-1},{maxTokens:1.5},{maxTokens:'4096'},{maxTokens:null},{maxTokens:16385},{unknown:1},
+    {thresholdTokens:64000,contextTokens:64000},{thresholdTokens:8000},{contextTokens:0},{contextTokens:1048577},{thresholdTokens:'48000'},{thresholdRatio:0},{thresholdRatio:1},{retainRatio:0.8},{headroomTokens:-1},{headroomTokens:null},{retainRatio:'0.16'}]){
+    disk(root,{routerCompaction:value});
+    expect(()=>loadConfig(root)).toThrow(/routerCompaction/);
+    expect(()=>reloadAgentConfig(initial)).toThrow(/routerCompaction/);
+  }
+});
+
 it('defaults idle thread retention to six hours and validates overrides',()=>{
   const root=directory();
   expect(loadConfig(root).threadIdleTtlMs).toBe(21_600_000);

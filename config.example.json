@@ -46,6 +46,12 @@
   "concurrency": 5,
   "workerTimeoutMs": 3600000,
   "routerTimeoutMs": 30000,
+  "routerCompaction": {
+    "maxTokens": 16384,
+    "thresholdRatio": 0.8,
+    "headroomTokens": 65536,
+    "retainRatio": 0.16
+  },
   "routerContextChars": 48000,
   "routerSessionMaxBytes": 4000000,
   "threadIdleTtlMs": 21600000,

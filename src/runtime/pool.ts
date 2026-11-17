@@ -5,6 +5,7 @@ import type { Config } from '../config.js';
 import type { ModelSelection } from '../types.js';
 import { ROUTER_COMPACTION_POLICY } from './router-compaction.js';
 import { NativeAgentRuntime } from './native.js';
+import { resolveRouterCompactionSettings } from './router-compaction-policy.js';
 
 export type AgentRole='router'|'worker';
 const reasoning={off:'none',low:'low',medium:'medium',high:'high',xhigh:'xhigh',max:'max'} as const;
@@ -42,7 +43,8 @@ export class NativeRuntimePool {
     const profile=roleProviderProfile(config,role),selection=config[role];
     const key=role==='router'?config.routerApiKey:config.workerApiKey;
     if(!key)throw new Error(`Configure ${profile.apiKeyEnv} in the private .env file for ${role}`);
-    const signature=createHash('sha256').update(JSON.stringify({profile,selection,key})).digest('hex');
+    const routerCompaction=role==='router'&&!options.memory?resolveRouterCompactionSettings(config.routerCompaction):undefined;
+    const signature=createHash('sha256').update(JSON.stringify({profile,selection,key,routerCompaction})).digest('hex');
     // Hosts are isolated; the signature remains private instead of entering session metadata.
     const provider=`boe-${role}`;
     const slotKey=role==='router'&&options.memory?'router-memory':role;
@@ -52,8 +54,9 @@ export class NativeRuntimePool {
       process.env[keyEnv]=key;
       slot={role,signature,keyEnv,refs:0,retired:false,native:NativeAgentRuntime.create({
         root:join(this.root,'dsh'),providers:{[provider]:{...profile,apiKeyEnv:keyEnv}},
+        ...(routerCompaction?{routerCompaction}:{}),
         ...(role==='router'&&!options.memory?{compactionRole:'router' as const,compactionModel:{provider,model:selection.model,maxTokens:selection.maxTokens}}:{}),
-        compaction:options.memory?false:{...(role==='router'?ROUTER_COMPACTION_POLICY:{}),summarizationProvider:provider,summarizationModel:selection.model},
+        compaction:options.memory?false:{...(role==='router'?{...ROUTER_COMPACTION_POLICY,maxTokens:routerCompaction!.maxTokens}:{}),summarizationProvider:provider,summarizationModel:selection.model},
       })};
       this.slots.add(slot);this.current.set(slotKey,slot);
       if(old){old.retired=true;if(!old.refs)void this.dispose(old).catch(()=>{});}

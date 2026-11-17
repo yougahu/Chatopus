@@ -72,6 +72,20 @@ async function fixture(adapter = new RouterAdapter(), overrides: Partial<Config>
 }
 
 describe('fresh Router sessions through the real dsh runtime', () => {
+  it('applies the configured working-context guard without changing the current source',async()=>{
+    class LargeWindowAdapter extends RouterAdapter {
+      override async resolveModel(provider:string,model:string):Promise<LlmResolvedModelInfo>{
+        return {provider,id:model,name:model,context:{contextWindow:1_048_576}};
+      }
+    }
+    const input=request('room','large-original','Current original: '+ 'Reference material. '.repeat(40000));
+    const small=await fixture(new LargeWindowAdapter(),{routerCompaction:{contextTokens:64000,thresholdTokens:48000,headroomTokens:16384}});
+    await expect(small.runtime.route(input)).rejects.toMatchObject({code:'CONTEXT_LIMIT'});
+    const large=await fixture(new LargeWindowAdapter());
+    expect(await large.runtime.route(input)).toMatchObject([{action:'reply_direct',sourceMessageIds:['large-original']}]);
+    expect(currentRequest(large.adapter.requests[0]).messages[0].text).toBe(input.messages[0].text);
+  });
+
   it('uses only the supplied snapshot in a fresh session while routing current IDs', async () => {
     const { runtime, adapter } = await fixture();
     const first = request('room', 'first-id', 'Owner budget remains ten dollars.');
