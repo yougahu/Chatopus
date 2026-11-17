@@ -50,3 +50,8 @@ it('sends the configured 8192-token budget and readable clock on initial and rep
     expect(payloads.at(-1)).toMatchObject({currentTime:Date.UTC(2026,10,12,16,5,6),currentTimeContext:{date:'2026-11-13',time:'00:05:06',timeZone:'Asia/Shanghai'},outputContract:{sourceMessageIds:['current-a','current-b']}});
   }
 });
+
+it('advertises read-only handoff actions in the current message contract',async()=>{
+ const {routerOutputContract}=await import('../src/runtime/router-request.js');
+ expect(routerOutputContract(request()).allowedActions).toContain('request_handoff');
+});

@@ -100,7 +100,7 @@ describe('QQ group file uploads', () => {
       const packet = JSON.parse(raw.toString()); packets.push(packet);
       client.send(JSON.stringify({ echo: packet.echo, status: packets.length === 1 ? 'failed' : 'ok', retcode: packets.length === 1 ? 1404 : 0, data: { file_id: 'confirmed-file' } }));
     });
-    expect(await adapter.uploadFile('qq:900:100', file, 'retry')).toEqual({ status: 'failed', reason: 'action_failed' });
+    expect(await adapter.uploadFile('qq:900:100', file, 'retry')).toEqual({ status: 'failed', reason: 'action_failed', platformCode:1404, retryable:false });
     await fs.writeFile(file.file, 'new contents');
     expect(await adapter.uploadFile('qq:900:100', file, 'retry')).toEqual({ status: 'failed', reason: 'invalid_output_file' });
     expect(packets).toHaveLength(1);
@@ -129,8 +129,8 @@ describe('QQ group file uploads', () => {
     const { root, file } = await artifact(), { adapter, client } = await setup(root);
     let packets = 0;
     client.on('message', raw => { packets++; client.send(JSON.stringify({ echo: JSON.parse(raw.toString()).echo, status: 'failed', retcode, data: null, message: 'send timeout' })); });
-    expect(await adapter.uploadFile('qq:900:100', file, 'handler-error')).toEqual({ status: 'unknown', reason: 'upload_result_unknown' });
-    expect(await adapter.uploadFile('qq:900:100', file, 'handler-error')).toEqual({ status: 'unknown', reason: 'upload_result_unknown' });
+    expect(await adapter.uploadFile('qq:900:100', file, 'handler-error')).toEqual({ status: 'unknown', reason: 'upload_result_unknown',platformCode:retcode });
+    expect(await adapter.uploadFile('qq:900:100', file, 'handler-error')).toEqual({ status: 'unknown', reason: 'upload_result_unknown',platformCode:retcode });
     expect(packets).toBe(1);
   });
 

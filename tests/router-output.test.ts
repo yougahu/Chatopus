@@ -19,6 +19,10 @@ const silence=(id='current')=>call('silence',{sourceMessageIds:[id],reason:'闲�
 const normalized=(blocks:ContentBlock[],r=request())=>normalizeRouterActionOutput(blocks,r);
 
 describe('Router action output normalization',()=>{
+  it('normalizes handoff actions using the same scoped protocol',()=>{
+    expect(JSON.parse(normalized([call('request_handoff',{sourceMessageIds:['current'],threadId:'thread',view:'previous'})])!)).toEqual([{action:'request_handoff',sourceMessageIds:['current'],threadId:'thread',view:'previous'}]);
+    expect(normalized([call('request_handoff',{sourceMessageIds:['current'],threadId:'foreign'})])).toBeUndefined();
+  });
   it('normalizes complete consecutive JSON objects without changing their actions',()=>{
     const r=request();r.messages.push(msg('second','other'));
     const actions=[{action:'reply_direct',sourceMessageIds:['current'],text:'含有 { 花括号 } 和 "引号"'},{action:'silence',sourceMessageIds:['second']}];

@@ -52,10 +52,13 @@
 | `recentMessageLimit` | `16` | 普通最近消息窗口 |
 | `threadCardLimit` | `12` | 普通任务卡窗口；必要引用另行固定 |
 | `threadIdleTtlMs` | `21600000` | 话题空闲时长阈值，6 小时 |
+| `workerInputScheduling` | `{"settleMs":750,"maxWaitMs":3000}` | 追加输入后的合批等待，需重启生效 |
 | `routerBatchWindowMs` | `150` | 路由合批等待窗口，可为 0 |
 | `routerBatchSize` | `8` | 每批条数，最大 20 |
 
 Coordinator 为同一任务版本维护固定的 Worker 截止时间，默认从首次启动起一小时，后续重试和格式修复共享这段时间及步骤预算，不因为重试延长。定时 Worker 采用 `workerTimeoutMs` 与该任务 `timeoutMs` 的较小值；超时和取消使结果失效，不保证每次运行都能完成固定次数的重试。持续 Router 使用自身的 turn 截止时间。
+
+`workerInputScheduling` 只影响追加输入后的继续执行，首条任务立即进入调度。须满足 `0 <= settleMs <= maxWaitMs <= 10000`；均为 0 时关闭额外合批等待。连续输入在最后一次输入后等待 `settleMs`，最多从第一条待处理输入起等待 `maxWaitMs`。输入和等待边界均持久化；这段等待不包含路由耗时、旧运行退出或并发排队。详见 [任务追问与交付](task-continuation.md)。
 
 ## 定时任务
 

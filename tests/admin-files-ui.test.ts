@@ -97,3 +97,12 @@ describe('admin group file delivery', () => {
     expect(app.text('.reply-files')).toContain('"><img src=x onerror=attack()>'); expect(app.text('.reply-files')).toContain('请查看审计记录'); expect(app.text('#detail-body')).not.toContain('/private/task-artifacts');
   });
 });
+
+it('explains publication holds and renders uncertain platform receipts',async()=>{
+ const row:any=fixture();row.data.reason='related_input_unresolved';row.status='pending';
+ row.deliveryEvents=[{kind:'delivery_attempt_settled',at:1000,data:{status:'unknown',platformCode:1200,reason:'send_result_unknown',retryable:false}}];
+ const app=setup(row);await app.run("view='outbox'; render()");await app.run('showDetail(0)');
+ expect(app.text('#detail-body')).toContain('关联消息尚未完成路由');
+ expect(app.text('#detail-body')).toContain('发送结果待确认');
+ expect(app.text('#detail-body')).toContain('平台代码 1200');
+});

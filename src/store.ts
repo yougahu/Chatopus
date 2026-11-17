@@ -1,3 +1,4 @@
+import {handoffRecord} from './task-handoff.js';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
@@ -5,16 +6,17 @@ import { dirname } from 'node:path';
 import { RoomMemoryStore, roomMemoryAtomic } from './room-memory-store.js';
 import { RouterSessionStore } from './router-session-store.js';
 import type { Schedule, ScheduleRun } from './scheduled-tasks/types.js';
-import type { BotReply, GroupMessage, OutgoingMessage, RouteAction, ThreadCard, ThreadInput, WorkerReport,RouterContextReader,RouterContextQuery } from './types.js';
+import type { BotReply, GroupMessage, OutgoingMessage, RouteAction, ThreadCard, ThreadInput, WorkerReport,RouterContextReader,RouterContextQuery,SendReceipt } from './types.js';
 
 export interface StoredThread extends ThreadCard { updatedAt: number; activeRunId?: string; failures: number;
+  pendingInputs?:import('./worker-input-scheduling.js').PendingWorkerInputs;
   workerBudget?:{revision:number;remainingSteps:number;deadlineAt:number} }
 export interface ResultRow { id: string; threadId: string; roomId: string; epoch: number; report: WorkerReport; status: string; dueAt: number; deferrals: number }
 export interface FileDelivery {
   artifactId:string;status:'pending'|'sending'|'sent'|'failed'|'unknown';attempts:number;
-  platformFileId?:string;reason?:string;sentAt?:number;
+  platformFileId?:string;reason?:string;sentAt?:number;attemptId?:string;
 }
-export interface OutboxRow { scheduleRunId?:string; hostLinks?:import('./tools/reply-links.js').ReplyLink[]; hostLinkTemplate?:string; id: string; message: OutgoingMessage; threadId?: string; associationThreadId?: string; revision?: number; epoch?: number; resultId?: string; kind?: 'acknowledgement'; status: string; attempts: number; dueAt: number; platformMessageId?: string; sentAt?: number; reason?: string;fileDeliveries?:FileDelivery[];fileDeliveryNoticeFor?:string }
+export interface OutboxRow { scheduleRunId?:string; hostLinks?:import('./tools/reply-links.js').ReplyLink[]; hostLinkTemplate?:string; id: string; message: OutgoingMessage; threadId?: string; associationThreadId?: string; revision?: number; epoch?: number; resultId?: string; kind?: 'acknowledgement'|'handoff'|'immediate';deliveryAttemptId?:string; status: string; attempts: number; dueAt: number; platformMessageId?: string; sentAt?: number; reason?: string;fileDeliveries?:FileDelivery[];fileDeliveryNoticeFor?:string }
 export interface ReferenceResolution {
   status:'none'|'resolved'|'unbound'|'missing'|'ambiguous'|'cycle'|'depth_limit';
   threadId?:string;
@@ -39,6 +41,7 @@ export class Store {
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,room TEXT NOT NULL,at INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,received_at INTEGER);
       CREATE INDEX IF NOT EXISTS messages_room ON messages(room,at);
+      CREATE INDEX IF NOT EXISTS messages_room_status ON messages(room,status);
       CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,message_id TEXT,event TEXT NOT NULL,data TEXT NOT NULL,at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,room TEXT NOT NULL,status TEXT NOT NULL,updated INTEGER NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS threads_status_updated ON threads(status,updated);
@@ -52,6 +55,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS outbox_platform_id ON outbox(room,status,json_extract(data,'$.platformMessageId'));
       CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS telemetry(id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,at INTEGER NOT NULL,data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS telemetry_delivery_outbox ON telemetry(json_extract(data,'$.outboxId'),id) WHERE kind IN ('delivery_attempt_started','delivery_attempt_settled');
       CREATE UNIQUE INDEX IF NOT EXISTS telemetry_event_id ON telemetry(kind,json_extract(data,'$.eventId')) WHERE json_type(data,'$.eventId')='text';
       `);
     if(!this.db.prepare('PRAGMA table_info(messages)').all().some(column=>column.name==='received_at'))
@@ -109,6 +113,12 @@ export class Store {
         const rows=this.db.prepare("SELECT data FROM messages WHERE room=? AND rowid<=? AND (?='' OR id=? OR json_extract(data,'$.messageId')=?) AND (?='' OR json_extract(data,'$.authorId')=?) AND (?='' OR instr(lower(json_extract(data,'$.text')),?)>0) ORDER BY rowid DESC LIMIT ? OFFSET ?")
           .all(room,lastMessage,id,id,id,author,author,term,term,limit+1,offset);
         return {messages:rows.slice(0,limit).map(row=>decode<GroupMessage>(row)),hasMore:rows.length>limit,...(rows.length>limit?{nextOffset:offset+limit}:{})};
+      }
+      if(query.kind==='handoffs'){
+        if(!id)throw new Error('Handoff reads require an exact thread ID');
+        const rows=this.db.prepare(`SELECT i.data FROM inputs i JOIN threads t ON t.id=i.thread_id JOIN messages m ON m.id=i.message_id
+          WHERE t.room=? AND t.id=? AND m.rowid<=? ORDER BY i.seq DESC LIMIT ? OFFSET ?`).all(room,id,lastMessage,limit+1,offset);
+        return {handoffs:rows.slice(0,limit).map(row=>handoffRecord(id,decode<ThreadInput>(row))),hasMore:rows.length>limit,...(rows.length>limit?{nextOffset:offset+limit}:{})};
       }
       if(query.kind==='task_inputs'){
         if(!id)throw new Error('Task input reads require an exact thread ID');
@@ -270,7 +280,8 @@ export class Store {
     if(!thread.participants.includes(message.authorId))thread.participants.push(message.authorId);
     this.db.prepare('INSERT INTO inputs VALUES(?,?,?,?)').run(thread.id,input.seq,message.id,JSON.stringify(input));
     if(thread.status!=='running')thread.status='queued';
-    thread.failures=0;this.saveThread(thread);this.bindMessageThread(message,thread.id);return input;
+    thread.failures=0;this.saveThread(thread);this.bindMessageThread(message,thread.id);
+    this.telemetry('input_committed',{threadId:thread.id,sourceId:message.id,revision:input.revision,inputSeq:input.seq});return input;
   }
   inputs(threadId:string):ThreadInput[] { return this.db.prepare('SELECT data FROM inputs WHERE thread_id=? ORDER BY seq').all(threadId).map(x=>decode(x)); }
   requirementSnapshot(threadId:string):WorkerReport['requirementSnapshot'] {
@@ -304,6 +315,12 @@ export class Store {
         return {messageId:sent.platformMessageId,replyToMessageId:sent.message.replyToMessageId,text:sent.message.text,sentAt:sent.sentAt!};
       }).reverse();
   }
+  deliveryAttempt(row:OutboxRow,phase:'started'|'settled',receipt?:SendReceipt,part='message',attemptId=row.deliveryAttemptId,attempt=row.attempts) {
+    if(!attemptId)return;
+    this.telemetry('delivery_attempt_'+phase,{eventId:`delivery:${attemptId}:${phase}`,outboxId:row.id,roomId:row.message.roomId,
+      threadId:row.threadId??row.associationThreadId,part,attemptId,attempt,...(receipt?{status:receipt.status,reason:receipt.reason,
+        platformCode:receipt.platformCode,retryable:receipt.retryable,platformMessageId:receipt.platformMessageId,platformFileId:receipt.platformFileId}:{})});
+  }
   telemetry(kind:string,data:unknown) { this.db.prepare('INSERT OR IGNORE INTO telemetry(kind,at,data) VALUES(?,?,?)').run(kind,Date.now(),JSON.stringify(data)); }
   recovery() {
     this.transaction(()=>{
@@ -311,6 +328,9 @@ export class Store {
       for(const thread of this.threadsInStatus('running')) {
         if(thread.activeRunId){
           const runId=thread.activeRunId;
+          const saved=this.db.prepare('SELECT data FROM runs WHERE id=?').get(runId);
+          const original=saved?JSON.parse(String(saved.data)):{epoch:thread.epoch,revision:thread.revision};
+          const superseded=original.revision<thread.revision;
           const calls=this.db.prepare("SELECT data FROM telemetry WHERE kind='model_call' AND json_extract(data,'$.runId')=?").all(runId).map(row=>decode<any>(row));
           const settled=new Set(this.db.prepare("SELECT json_extract(data,'$.measurementId') AS id FROM telemetry WHERE kind='model' AND json_extract(data,'$.runId')=?").all(runId).map(row=>row.id));
           const pending=calls.filter(call=>!settled.has(call.measurementId)),usage={inputTokens:0,outputTokens:0,cacheReadTokens:0,cacheWriteTokens:0};
@@ -318,19 +338,19 @@ export class Store {
           // An interrupted in-flight call may never return usage. Keep the known
           // portion and explicitly retain that uncertainty, even with no ledger rows.
           this.telemetry('model',{eventId:'interrupted:'+runId,measurementId:'interrupted:'+runId,role:'worker',threadId:thread.id,runId,sessionId:thread.sessionId,
-            status:'failed',code:'INTERRUPTED',usageStatus:pending.some(call=>call.usage)?'partial':'unknown',unsettled:true,...usage,
+            status:superseded?'superseded':'failed',code:superseded?'SUPERSEDED':'INTERRUPTED',usageStatus:pending.some(call=>call.usage)?'partial':'unknown',unsettled:true,...usage,
             modelCalls:pending.length,missingUsageCalls:pending.filter(call=>!call.usage).length});
           const steps=Math.max(0,...calls.map(call=>Number.isSafeInteger(call.step)?call.step:0));
           if(thread.workerBudget?.revision===thread.revision)thread.workerBudget.remainingSteps=Math.max(0,thread.workerBudget.remainingSteps-steps-1);
-          thread.lastFailure={runId,code:'INTERRUPTED',revision:thread.revision,steps,retryable:true};
-          this.saveRun(runId,thread.id,'interrupted',{epoch:thread.epoch,revision:thread.revision,steps,code:'INTERRUPTED'});
+          if(!superseded)thread.lastFailure={runId,code:'INTERRUPTED',revision:thread.revision,steps,retryable:true};
+          this.saveRun(runId,thread.id,superseded?'superseded':'interrupted',{...original,endedAt:Date.now(),steps,code:'INTERRUPTED',...(superseded?{supersededByRevision:thread.revision}:{})});
         }
         thread.epoch++;thread.activeRunId=undefined;thread.status='queued';this.saveThread(thread);
       }
       // A process may die after platform accepted a send. Never blindly repeat it.
       for(const row of this.outbox('sending')){
-        row.status='unknown';row.reason='interrupted_delivery';
-        for(const file of row.fileDeliveries??[])if(file.status==='sending'){file.status='unknown';file.reason='interrupted_delivery';}
+        row.status='unknown';row.reason='interrupted_delivery';this.deliveryAttempt(row,'settled',{status:'unknown',reason:row.reason});
+        for(const file of row.fileDeliveries??[])if(file.status==='sending'){file.status='unknown';file.reason='interrupted_delivery';this.deliveryAttempt(row,'settled',{status:'unknown',reason:file.reason},file.artifactId,file.attemptId,file.attempts);}
         this.saveOutbox(row);
       }
     });

@@ -153,7 +153,15 @@ describe('reverse websocket', () => {
   it('distinguishes explicit platform rejection from uncertain delivery', async () => {
     const { adapter, client } = await setup();
     client.on('message', raw => client.send(JSON.stringify({ echo: JSON.parse(raw.toString()).echo, status: 'failed', retcode: 1404, data: {} })));
-    expect(await adapter.send({ roomId: 'qq:900:100', text: 'result' }, 'reject')).toEqual({ status: 'failed', reason: 'action_failed' });
+    expect(await adapter.send({ roomId: 'qq:900:100', text: 'result' }, 'reject')).toEqual({ status: 'failed', reason: 'action_failed', platformCode:1404, retryable:false });
+  });
+  it.each([1200,200,1500])('never retries an ambiguous send handler error %i, including duplicate callers',async retcode=>{
+    const {adapter,client}=await setup();let requests=0;
+    client.on('message',raw=>{requests++;client.send(JSON.stringify({echo:JSON.parse(raw.toString()).echo,status:'failed',retcode,data:null}));});
+    const message={roomId:'qq:900:100',text:'One result'};
+    const receipts=await Promise.all([adapter.send(message,'same-result'),adapter.send(message,'same-result')]);
+    expect(receipts).toEqual(Array(2).fill({status:'unknown',reason:'send_result_unknown',platformCode:retcode}));
+    expect(await adapter.send(message,'same-result')).toEqual(receipts[0]);expect(requests).toBe(1);
   });
   it('marks sent actions unknown after connection loss', async () => {
     const { adapter, client } = await setup();

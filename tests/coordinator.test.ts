@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { Coordinator } from '../src/coordinator.js';
 import { Store } from '../src/store.js';
@@ -14,6 +14,7 @@ class ControlledRuntime implements RuntimePort {
   readonly workers: WorkerRequest[] = [];
   readonly steers: Array<{ threadId: string; input: ThreadInput }> = [];
   readonly cancellations: string[] = [];
+  readonly supersessions:Array<{threadId:string;runId:string;fromRevision:number;toRevision:number}>=[];
   private pending = new Map<number, { resolve: (report: WorkerReport) => void; reject: (error: Error) => void }>();
   decide: (request: RouterRequest) => RouteAction[] | Promise<RouteAction[]> = request => request.result
     ? [{ action: 'publish_result', resultId: request.result.id }]
@@ -24,6 +25,8 @@ class ControlledRuntime implements RuntimePort {
     return new Promise((resolve, reject) => {
       this.pending.set(index, { resolve, reject });
       request.signal?.addEventListener('abort', () => {
+        // Simulate an operation that takes time to settle after supersede.
+        if(request.signal?.reason?.code==='SUPERSEDED')return;
         this.pending.delete(index); reject(new Error('aborted'));
       }, { once: true });
     });
@@ -42,7 +45,8 @@ class ControlledRuntime implements RuntimePort {
     this.pending.delete(index); pending.reject(error);
   }
   async steer(threadId: string, input: ThreadInput): Promise<void> { this.steers.push({ threadId, input }); }
-  async cancel(threadId: string): Promise<void> { this.cancellations.push(threadId); }
+  async supersede(request:{threadId:string;runId:string;fromRevision:number;toRevision:number}){this.supersessions.push(request);}
+  async cancel(threadId: string): Promise<void> { this.cancellations.push(threadId);for(const [index,p]of this.pending)if(this.workers[index].thread.id===threadId){this.pending.delete(index);p.reject(new Error('aborted'));} }
   async close(): Promise<void> { for (const p of this.pending.values()) p.reject(new Error('closed')); this.pending.clear(); }
 }
 
@@ -54,7 +58,7 @@ const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
 function fixture(publisher: PublisherPort = new MemoryPublisher()) {
   const directory = mkdtempSync(join(tmpdir(), 'boe2-coordinator-'));
-  const config = loadConfig(directory, { botCallNames:['助手'], apiKey: '', stateDir: join(directory, 'state'), concurrency: 2, routerBatchWindowMs: 0 });
+  const config = loadConfig(directory, { botCallNames:['助手'], apiKey: '', stateDir: join(directory, 'state'), concurrency: 2, routerBatchWindowMs: 0,workerInputScheduling:{settleMs:0,maxWaitMs:0} });
   const store = new Store(join(directory, 'state.sqlite'));
   const runtime = new ControlledRuntime();
   const coordinator = new Coordinator(config, store, runtime, publisher);
@@ -75,6 +79,90 @@ function appendTo(threadId: string, request: RouterRequest): RouteAction[] {
 }
 
 function answers(publisher: MemoryPublisher) { return publisher.messages.filter(item => !item.dedupeKey.startsWith('ack:')); }
+it('answers a quoted handoff query from stored text without changing a busy Worker',async()=>{
+ const {coordinator,runtime,store,publisher}=fixture();const original='部署说明：'+ '完整条件。'.repeat(220);
+ runtime.decide=request=>[{action:'open_thread',sourceMessageIds:request.messages.map(m=>m.id),subject:'部署说明',resolvedRequest:original}];
+ await coordinator.receive(message('initial'));const before=store.threads()[0];
+ runtime.decide=request=>[{action:'request_handoff',sourceMessageIds:request.messages.map(m=>m.id),threadId:before.id}];
+ await coordinator.receive(message('inspect','把交接原文给我看',{replyToMessageId:'initial'}));
+ const after=store.thread(before.id)!;
+ expect(after.revision).toBe(before.revision);expect(after.workerBudget).toEqual(before.workerBudget);
+ expect(store.inputs(before.id)).toHaveLength(1);expect(runtime.workers).toHaveLength(1);expect(runtime.supersessions).toHaveLength(0);
+ expect(answers(publisher).at(-1)!.message.text).toContain(original);
+ expect(store.outbox('sent').at(-1)).toMatchObject({kind:'handoff',associationThreadId:before.id});
+});
+it('commits one correction and an immediate handoff while old cleanup is pending',async()=>{
+ const {coordinator,runtime,store,publisher}=fixture();await coordinator.receive(message('initial'));
+ const thread=store.threads()[0];
+ runtime.decide=request=>[{action:'append_thread',sourceMessageIds:request.messages.map(m=>m.id),threadId:thread.id,kind:'correction',
+   resolvedRequest:'部署目标改为 Node 22，保留原目录',correctionTarget:'用 Node 22 替换 Node 20',immediateReply:{kind:'handoff',view:'changes'}}];
+ const correction=message('correction','改用 Node 22，把更正后的交接给我看',{replyToMessageId:'initial'});
+ await Promise.all([coordinator.receive(correction),coordinator.receive(correction)]);
+ expect(store.inputs(thread.id)).toHaveLength(2);expect(runtime.workers).toHaveLength(1);expect(runtime.supersessions).toHaveLength(1);
+ expect(answers(publisher)).toHaveLength(1);expect(answers(publisher)[0].message.text).toContain('部署目标改为 Node 22');
+ runtime.complete(0);await until(()=>runtime.workers.length===2,coordinator);
+ runtime.decide=request=>[{action:'publish_result',resultId:request.result!.id}];runtime.complete(1);await coordinator.drain(1000);
+ expect(store.db.prepare("SELECT count(*) n FROM runs WHERE status='superseded'").get()?.n).toBe(1);
+ expect(store.thread(thread.id)!.failures).toBe(0);
+});
+it('coalesces three durable corrections into one resumed run without losing history',async()=>{
+ const {coordinator,config,runtime,store,publisher}=fixture();config.workerInputScheduling={settleMs:30,maxWaitMs:100};
+ await coordinator.receive(message('initial'));const first=runtime.workers[0],thread=store.threads()[0];runtime.decide=request=>appendTo(thread.id,request);
+ for(const [id,text]of [['a','改为 Node 22'],['b','目录保留'],['c','输出中文']])await coordinator.receive(message(id,text));
+ expect(runtime.supersessions).toHaveLength(1);expect(runtime.workers).toHaveLength(1);expect(first.signal?.aborted).toBe(true);
+ runtime.complete(0,{shortAnswer:'旧结果'});await until(()=>runtime.workers.length===2,coordinator);
+ const next=runtime.workers[1];expect(next.runId).not.toBe(first.runId);expect(next.thread.sessionId).toBe(first.thread.sessionId);
+ expect(next.inputs.map(input=>input.message.messageId)).toEqual(['initial','a','b','c']);expect(next.thread.revision).toBe(4);
+ runtime.complete(1,{shortAnswer:'合并后的结果'});await coordinator.drain(1000);
+ expect(answers(publisher).map(x=>x.message.text)).toEqual(['合并后的结果']);
+});
+it.each(['request_handoff','append_thread'] as const)('holds an old result while a quoted %s is not routed',async action=>{
+ const {coordinator,runtime,store,publisher}=fixture();await coordinator.receive(message('initial'));const thread=store.threads()[0];
+ store.enqueue({roomId:'room',text:'pending answer'},{id:'held-result',threadId:thread.id,revision:thread.revision,epoch:thread.epoch});
+ let entered!:()=>void,release!:()=>void;const entering=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+ runtime.decide=async request=>{entered();await gate;return [{action,sourceMessageIds:request.messages.map(m=>m.id),threadId:thread.id}];};
+ const receiving=coordinator.receive(message('update','核对引用的任务',{replyToMessageId:'initial'}));await entering;
+ await coordinator.tick();expect(publisher.messages.some(x=>x.dedupeKey==='held-result')).toBe(false);
+ release();await receiving;await coordinator.tick();
+ expect(store.outbox().find(x=>x.id==='held-result')!.status).toBe(action==='append_thread'?'stale':'sent');
+});
+it('keeps a failed related route visible without releasing an old answer',async()=>{
+ const {coordinator,runtime,store,publisher}=fixture();await coordinator.receive(message('initial'));const thread=store.threads()[0];
+ store.enqueue({roomId:'room',text:'old answer'},{id:'held-failed-route',threadId:thread.id,revision:thread.revision,epoch:thread.epoch});
+ runtime.decide=()=>{throw new Error('synthetic routing failure');};
+ await coordinator.receive(message('update','助手，预算要改',{replyToMessageId:'initial'}));await coordinator.tick();
+ expect(store.outbox().find(row=>row.id==='held-failed-route')).toMatchObject({status:'pending',reason:'related_input_unresolved'});
+ expect(publisher.messages.some(item=>item.dedupeKey==='held-failed-route')).toBe(false);
+});
+it('records slow cleanup once while other tasks and immediate replies remain available',async()=>{
+ const {coordinator,runtime,store,publisher}=fixture();await coordinator.receive(message('initial'));const thread=store.threads()[0];
+ vi.useFakeTimers({toFake:['setTimeout','clearTimeout']});
+ try{
+  runtime.decide=request=>[{action:'append_thread',threadId:thread.id,sourceMessageIds:request.messages.map(m=>m.id),immediateReply:{kind:'answer',text:'仍在处理，新的条件已保存。'}}];
+  const correction=coordinator.receive(message('correction','助手，改为300元。还在处理吗？'));
+  await vi.advanceTimersByTimeAsync(1);await correction;
+  await vi.advanceTimersByTimeAsync(5100);
+  expect(store.db.prepare("SELECT count(*) n FROM telemetry WHERE kind='worker_cleanup_blocked'").get()?.n).toBe(1);
+  expect(runtime.workers).toHaveLength(1);expect(answers(publisher)).toHaveLength(1);
+  runtime.decide=request=>[{action:'open_thread',sourceMessageIds:request.messages.map(m=>m.id),subject:'独立任务'}];
+  const independent=coordinator.receive(message('independent','助手，整理另一份报告'));
+  await vi.advanceTimersByTimeAsync(1);await independent;
+  expect(runtime.workers).toHaveLength(2);expect(runtime.workers[1].thread.id).not.toBe(thread.id);
+ }finally{vi.useRealTimers();}
+});
+it('keeps each delivery receipt even when a later attempt succeeds',async()=>{
+ let calls=0;const {coordinator,store}=fixture({send:async()=>++calls===1?{status:'failed',reason:'synthetic_rejection',platformCode:400}:{status:'sent',platformMessageId:'confirmed'}});
+ store.enqueue({roomId:'room',text:'synthetic answer'},{id:'audit-send'});await coordinator.tick();
+ const pending=store.outbox('pending')[0];pending.dueAt=0;store.saveOutbox(pending);await coordinator.tick();
+ const events=store.db.prepare("SELECT data FROM telemetry WHERE kind='delivery_attempt_settled' ORDER BY id").all().map(r=>JSON.parse(String(r.data)));
+ expect(events.map(e=>e.status)).toEqual(['failed','sent']);expect(events[0].platformCode).toBe(400);
+ expect(events[0].attemptId).not.toBe(events[1].attemptId);expect(store.outbox('sent')).toHaveLength(1);
+});
+it('does not retry a permanent rejection and preserves unknown delivery across recovery',async()=>{
+ let calls=0;const {coordinator,store}=fixture({send:async()=>{calls++;return {status:'failed',reason:'action_failed',platformCode:1404,retryable:false};}});
+ store.enqueue({roomId:'room',text:'synthetic answer'},{id:'reject'});await coordinator.tick();await coordinator.tick();expect(calls).toBe(1);
+ store.enqueue({roomId:'room',text:'uncertain answer'},{id:'unknown',status:'unknown'});store.recovery();await coordinator.tick();expect(calls).toBe(1);
+});
 it('returns the explicit model error without launching another Worker after exhausted model retries',async()=>{
  const {coordinator,runtime,store,publisher}=fixture();await coordinator.receive(message('model-failure'));
  runtime.fail(0,Object.assign(new Error('private provider detail'),{code:MODEL_RETRIES_EXHAUSTED}));await coordinator.drain(1000);
@@ -209,8 +297,8 @@ describe('quoted question images', () => {
     runtime.decide = silence; await coordinator.receive(original);
     runtime.decide = request => appendTo(threadId, request);
     await coordinator.receive(message('supplement', '补充条件见这张图', { replyToMessageId: original.messageId }));
-    expect(runtime.steers).toHaveLength(1);
-    expect(runtime.steers[0].input).toMatchObject({ seq: 2, contextMessages: [original] });
+    expect(runtime.supersessions).toHaveLength(1);
+    expect(store.inputs(threadId)[1]).toMatchObject({ seq: 2, contextMessages: [original] });
     runtime.complete(0);
     await until(() => runtime.workers.length === 2, coordinator);
     expect(runtime.workers[1].inputs).toHaveLength(2);
@@ -218,16 +306,16 @@ describe('quoted question images', () => {
     runtime.complete(1); await coordinator.drain(1000);
   });
 
-  it('continues routing a cancellation while a steered image is still downloading', async () => {
+  it('continues routing a cancellation while supersede cleanup is still pending', async () => {
     const { coordinator, runtime, store } = fixture();
     await coordinator.receive(message('question'));
     const threadId=store.threads()[0].id;
     let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);
-    runtime.steer=async(_thread,input)=>{runtime.steers.push({threadId,input});await gate;};
+    runtime.supersede=async request=>{runtime.supersessions.push(request);await gate;};
     try{
       runtime.decide=request=>appendTo(threadId,request);
       await coordinator.receive(image('slow-image',{isMentioned:true}));
-      expect(runtime.steers).toHaveLength(1);
+      expect(runtime.supersessions).toHaveLength(1);
       runtime.decide=request=>[{action:'request_cancel',sourceMessageIds:request.messages.map(m=>m.id),threadId}];
       await coordinator.receive(message('cancel','停止'));
       expect(runtime.cancellations).toContain(threadId);
@@ -401,7 +489,7 @@ describe('durable work acknowledgements', () => {
     expect(acknowledgements(publisher)[1].message.text).toBe('我按你补充的条件继续核对。');
     await coordinator.receive(message('3', '还有一条补充'));
     expect(acknowledgements(publisher)).toHaveLength(2);
-    runtime.complete(1, { coveredInputSeq: 3, basedOnRevision: 3 }); await coordinator.drain(1000);
+    runtime.complete(1);await until(()=>runtime.workers.length===3,coordinator);runtime.complete(2); await coordinator.drain(1000);
     expect(runtime.workers[1].thread.sessionId).toBe(runtime.workers[0].thread.sessionId);
   });
 
@@ -453,7 +541,7 @@ describe('durable work acknowledgements', () => {
     expect(acknowledgements(published).map(item => item.message.text)).toEqual(['我改按 Node 22 的配置核对。']);
     expect(store.outbox('stale').map(row => row.id)).toContain(`ack:${thread.id}:1`);
     expect(store.outbox('sent').find(row => row.kind === 'acknowledgement')?.revision).toBe(2);
-    runtime.complete(0, { coveredInputSeq: 2, basedOnRevision: 2 }); await coordinator.drain(1000);
+    runtime.complete(0);await until(()=>runtime.workers.length===2,coordinator);runtime.complete(1); await coordinator.drain(1000);
   });
 
   it('does not resend an uncertain acknowledgement when active inputs or Worker retries arrive', async () => {
@@ -498,7 +586,7 @@ describe('durable work acknowledgements', () => {
     await coordinator.receive(message('2', '再补充一个条件'));
     expect(store.outbox().filter(row => row.kind === 'acknowledgement')).toHaveLength(1);
     release(); await first;
-    runtime.complete(0, { coveredInputSeq: 2, basedOnRevision: 2 }); await coordinator.drain(1000);
+    runtime.complete(0);await until(()=>runtime.workers.length===2,coordinator);runtime.complete(1); await coordinator.drain(1000);
     expect(acknowledgements(published)).toHaveLength(1);
     expect(answers(published)).toHaveLength(1);
   });
@@ -525,7 +613,7 @@ describe('durable work acknowledgements', () => {
     expect(store.outbox().filter(row => row.kind === 'acknowledgement')).toHaveLength(1);
     expect(attempts).toEqual([oldKey]);
     if (outcome === 'completed') {
-      runtime.complete(0, { coveredInputSeq: 2, basedOnRevision: 2 });
+      runtime.complete(0);await until(()=>runtime.workers.length===2,coordinator);runtime.complete(1);
       await until(() => store.thread(thread.id)?.status === 'idle', coordinator);
     } else if (outcome === 'cancelled') {
       runtime.decide = request => [{ action: 'request_cancel', sourceMessageIds: request.messages.map(m => m.id), threadId: thread.id }];
@@ -543,7 +631,7 @@ describe('durable work acknowledgements', () => {
       expect(ack[0]).toMatchObject({ dedupeKey: latestKey, message: { replyToMessageId: '2' } });
       expect(ack[0].message.text.trim().length).toBeGreaterThan(0);
       expect(ack[0].message.text).not.toContain('Node 20');
-      runtime.complete(0, { coveredInputSeq: 2, basedOnRevision: 2 });
+      runtime.complete(0);await until(()=>runtime.workers.length===2,coordinator);runtime.complete(1);
     } else {
       expect(attempts).toEqual([oldKey]);
       expect(acknowledgements(published)).toHaveLength(0);
@@ -556,7 +644,7 @@ describe('durable work acknowledgements', () => {
   it.each(['pending', 'sent', 'sending'] as const)('recovers a %s acknowledgement across database reopen without duplicating it', async status => {
     const directory = mkdtempSync(join(tmpdir(), 'boe2-ack-reopen-'));
     const file = join(directory, 'state.sqlite');
-    const config = loadConfig(directory, { botCallNames:['助手'], apiKey: '', stateDir: join(directory, 'work'), routerBatchWindowMs: 0 });
+    const config = loadConfig(directory, { botCallNames:['助手'], apiKey: '', stateDir: join(directory, 'work'), routerBatchWindowMs: 0,workerInputScheduling:{settleMs:0,maxWaitMs:0} });
     const previous = new Store(file), question = message('persisted');
     previous.ingest(question); previous.messageStatus(question.id, 'routed');
     const thread = previous.createThread(question, 'persistent task', true);
@@ -628,7 +716,7 @@ describe('durable Thread execution', () => {
     expect(store.outbox('sent').find(row => row.resultId)?.message.attachments).toEqual([newImage]);
     expect(JSON.stringify(store.db.prepare("SELECT data FROM results WHERE status='queued'").all())).toContain('new-image');
   });
-  it('deduplicates concurrent intake, steers corrections, suppresses old answer and runs uncovered input', async () => {
+  it('deduplicates intake, supersedes the owned run and resumes uncovered input', async () => {
     const { coordinator, store, runtime, publisher } = fixture();
     const first = message('1');
     await Promise.all([coordinator.receive(first), coordinator.receive(first)]);
@@ -636,7 +724,7 @@ describe('durable Thread execution', () => {
     const thread = store.threads()[0];
     runtime.decide = request => appendTo(thread.id, request);
     await coordinator.receive(message('2', '预算改成 5 元'));
-    expect(runtime.steers).toHaveLength(1); expect(runtime.steers[0].input.seq).toBe(2);
+    expect(runtime.supersessions).toHaveLength(1); expect(runtime.supersessions[0].toRevision).toBe(2);
     runtime.complete(0, { shortAnswer: '过期的 20元 答案' });
     await until(() => runtime.workers.length === 2, coordinator);
     expect(answers(publisher)).toHaveLength(0);
@@ -647,14 +735,15 @@ describe('durable Thread execution', () => {
     expect(store.thread(thread.id)?.status).toBe('idle');
   });
 
-  it('accepts a running Worker report that consumed steer without redundant execution', async () => {
+  it('rejects a superseded report even if it claims to cover the new input', async () => {
     const { coordinator, store, runtime, publisher } = fixture();
     await coordinator.receive(message('1'));
     runtime.decide = request => appendTo(store.threads()[0].id, request);
     await coordinator.receive(message('2', '保留原始编号'));
-    runtime.complete(0, { coveredInputSeq: 2, basedOnRevision: 2, shortAnswer: '已考虑保留原始编号' });
-    await coordinator.drain(1000);
-    expect(runtime.workers).toHaveLength(1); expect(answers(publisher)[0].message.text).toBe('已考虑保留原始编号');
+    runtime.complete(0, { coveredInputSeq: 2, basedOnRevision: 2, shortAnswer: '旧运行自称已覆盖' });
+    await until(()=>runtime.workers.length===2,coordinator);expect(answers(publisher)).toHaveLength(0);
+    runtime.complete(1,{shortAnswer:'已考虑保留原始编号'});await coordinator.drain(1000);
+    expect(runtime.workers).toHaveLength(2); expect(answers(publisher)[0].message.text).toBe('已考虑保留原始编号');
     expect(answers(publisher)[0].message.replyToMessageId).toBe('2');
   });
 
@@ -818,7 +907,7 @@ describe('publication and restart', () => {
   it('restores durable queued inputs and unknown publication across actual database reopen', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'boe2-reopen-'));
     const path = join(directory, 'state.sqlite');
-    const config = loadConfig(directory, { botCallNames:['助手'], apiKey: '', stateDir: join(directory, 'work'), routerBatchWindowMs: 0 });
+    const config = loadConfig(directory, { botCallNames:['助手'], apiKey: '', stateDir: join(directory, 'work'), routerBatchWindowMs: 0,workerInputScheduling:{settleMs:0,maxWaitMs:0} });
     const previous = new Store(path);
     const question = message('persisted');
     previous.ingest(question); previous.messageStatus(question.id, 'routed');
@@ -1029,7 +1118,7 @@ describe('durable per-room microbatches', () => {
     release(); await first;
   });
 
-  it('applies every grouped supplement once and steers a running Worker in intake order', async () => {
+  it('persists grouped supplements in intake order and supersedes the run once', async () => {
     const { coordinator, config, runtime, store, publisher } = fixture();
     await coordinator.receive(message('1', '整理问题'));
     config.routerBatchWindowMs = 20;
@@ -1037,10 +1126,13 @@ describe('durable per-room microbatches', () => {
     runtime.decide = request => request.result ? [{ action: 'publish_result', resultId: request.result.id }]
       : [{ action: 'append_thread', sourceMessageIds: request.messages.map(m => m.id).reverse(), threadId: thread.id, kind: 'correction' }];
     await Promise.all([coordinator.receive(message('2', '预算 5 元')), coordinator.receive(message('3', '保留原始目录'))]);
-    expect(runtime.steers.map(x => [x.input.seq, x.input.message.messageId])).toEqual([[2, '2'], [3, '3']]);
+    expect(runtime.steers).toHaveLength(0);expect(runtime.supersessions).toHaveLength(1);
+    expect(runtime.supersessions[0].toRevision).toBe(3);
+    expect(store.inputs(thread.id).slice(1).map(x=>[x.seq,x.message.messageId])).toEqual([[2,'2'],[3,'3']]);
     expect(store.inputs(thread.id)).toHaveLength(3);
-    runtime.complete(0, { coveredInputSeq: 3, basedOnRevision: 3 }); await coordinator.drain(1000);
-    expect(runtime.workers).toHaveLength(1);
+    runtime.complete(0, { coveredInputSeq: 3, basedOnRevision: 3 });await until(()=>runtime.workers.length===2,coordinator);
+    runtime.complete(1);await coordinator.drain(1000);
+    expect(runtime.workers).toHaveLength(2);
     expect(answers(publisher)[0].message.replyToMessageId).toBe('3');
   });
 
@@ -1332,4 +1424,15 @@ it('still processes a newer correction after the superseded run exhausts its bud
  runtime.fail(0,Object.assign(new Error('limit'),{code:'STEP_LIMIT',workerProgress:{steps:96}}));
  await until(()=>runtime.workers.length===2,coordinator);expect(runtime.workers[1].budget?.remainingSteps).toBe(96);
  runtime.complete(1);await coordinator.drain(1000);
+});
+
+it.each(['report','failure'] as const)('uses the persisted run binding before the supersede callback catches up (%s)',async outcome=>{
+ const {coordinator,runtime,store,publisher}=fixture();await coordinator.receive(message('initial'));const thread=store.threads()[0];
+ const update=message('committed','助手，改用 Node 22');store.ingest(update);store.messageStatus(update.id,'routed');store.append(thread,update,'correction');
+ expect(runtime.supersessions).toHaveLength(0);
+ if(outcome==='report')runtime.complete(0,{coveredInputSeq:2,basedOnRevision:2,shortAnswer:'incorrect claim by old run'});
+ else runtime.fail(0,new Error('old run failed after commit'));
+ await until(()=>runtime.workers.length===2,coordinator);
+ expect(store.thread(thread.id)?.failures).toBe(0);expect(answers(publisher)).toHaveLength(0);
+ expect(store.db.prepare('SELECT status FROM runs WHERE id=?').get(runtime.workers[0].runId)?.status).toBe('superseded');
 });

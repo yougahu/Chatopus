@@ -55,6 +55,9 @@ export interface SendReceipt {
   platformMessageId?: string;
   platformFileId?: string;
   reason?: string;
+  /** Safe protocol diagnostics; never include raw platform response bodies. */
+  platformCode?: number;
+  retryable?: boolean;
 }
 /** A reply confirmed sent by the platform; no ID is invented when its receipt omits one. */
 export interface BotReply {
@@ -161,6 +164,7 @@ interface RouteContext {
   resolvedRequest?: string;
   routingMetadata?: Record<string,unknown>;
   correctionTarget?: string;
+  immediateReply?: {kind:'handoff';view:'current'|'changes'} | {kind:'answer';text:string};
 }
 type MemberMemoryProposal = { memoryUpdates?: import('./memory/types.js').MemberMemoryUpdate[] };
 export type MessageRouteAction = (
@@ -168,6 +172,7 @@ export type MessageRouteAction = (
   | ({ action: 'open_thread'; sourceMessageIds: string[]; subject: string; acknowledgement?: string; scheduleOperations?:import('./scheduled-tasks/tools.js').ScheduleModelMutation[] } & RouteContext)
   | ({ action: 'append_thread'; sourceMessageIds: string[]; threadId: string; kind?: 'supplement' | 'correction'; acknowledgement?: string } & RouteContext)
   | { action: 'request_status' | 'request_cancel'; sourceMessageIds: string[]; threadId: string }
+  | { action: 'request_handoff'; sourceMessageIds: string[]; threadId: string; view?:'current'|'previous'|'changes' }
   | { action:'manage_schedule';sourceMessageIds:string[];operation:import('./scheduled-tasks/tools.js').ScheduleModelMutation }
 ) & MemberMemoryProposal;
 export type RouteAction =
@@ -180,7 +185,7 @@ export interface RouterAddressing {
   replyTo?: { kind: 'bot' | 'member' | 'unknown'; authorId?: string; threadId?: string };
 }
 export interface RouterContextQuery {
-  kind:'messages'|'threads'|'replies'|'memory'|'task_inputs';
+  kind:'messages'|'threads'|'replies'|'memory'|'task_inputs'|'handoffs';
   id?:string;
   query?:string;
   authorId?:string;
@@ -189,6 +194,7 @@ export interface RouterContextQuery {
   textOffset?:number;
 }
 export interface RouterContextPage {
+  handoffs?:Array<ReturnType<typeof import('./task-handoff.js').handoffRecord>>;
   messages?:GroupMessage[];
   threads?:ThreadCard[];
   replies?:BotReply[];
@@ -284,6 +290,8 @@ export interface RuntimePort {
   refreshReplyPreferences?(input:{roomId:string;text:string;memberMemory:import('./memory/member-updates.js').MemberMemoryProjection[];
     previousMemberMemory?:import('./memory/member-updates.js').MemberMemoryProjection[];replyToMemberId?:string;sourceText?:string}):Promise<string>;
   steer(threadId: string, input: ThreadInput): Promise<void>;
+  /** Stop only this run; its durable inputs continue through the normal resume path. */
+  supersede?(request:{threadId:string;runId:string;fromRevision:number;toRevision:number}):Promise<void>;
   cancel(threadId: string): Promise<void>;
   close(): Promise<void>;
   routerContextBudget?(roomId?:string):Promise<number>;

@@ -13,6 +13,6 @@ export function routerOutputContract(request:RouterRequest):NonNullable<RouterRe
   if(request.event!=='messages')return {format:'json_array',allowedActions:['publish_result','defer_result'],resultId:request.result?.id,sourceMessageIds:[],scheduleSourceGroups:[]};
   const groups=new Map<string,string[]>();
   for(const message of request.messages)groups.set(message.authorId,[...(groups.get(message.authorId)??[]),message.id]);
-  return {format:'json_array',allowedActions:['silence','reply_direct','clarify','open_thread','append_thread','request_status','request_cancel','manage_schedule'],
+  return {format:'json_array',allowedActions:['silence','reply_direct','clarify','open_thread','append_thread','request_status','request_handoff','request_cancel','manage_schedule'],
     sourceMessageIds:request.messages.map(message=>message.id),scheduleSourceGroups:[...groups].map(([authorId,sourceMessageIds])=>({authorId,sourceMessageIds}))};
 }

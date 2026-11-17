@@ -107,7 +107,7 @@ function fixture(publisher = new VerifiedPublisher()) {
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   const directory = mkdtempSync(join(tmpdir(), 'boe2-scheduled-coordinator-'));
   const config = loadConfig(directory, { botCallNames: ['助手'], apiKey: 'test-key', workerApiKey: 'test-key',
-    worker: { model: 'test', provider: 'boe-openai' }, stateDir: join(directory, 'state'), concurrency: 2, routerBatchWindowMs: 0,
+    worker: { model: 'test', provider: 'boe-openai' }, stateDir: join(directory, 'state'), concurrency: 2, routerBatchWindowMs: 0, workerInputScheduling: {settleMs:0,maxWaitMs:0},
     scheduledTasks: { enabled: true, scanIntervalMs: 1, concurrency: 1 },
     qq: { enabled: false, selfId: '100', accessToken: '', allowedGroupIds: ['200'], host: '127.0.0.1', port: 0 } });
   let store = new Store(join(directory, 'state.sqlite'));
@@ -282,7 +282,7 @@ describe('scheduled execution through the Coordinator', () => {
   });
 
   it('commits a Worker proposal only after ready acceptance and lets the same owner cancel through Router', async () => {
-    const f = fixture(); await f.coordinator.receive(message('work'));
+    const f = fixture(); f.runtime.ignoreAbort=true; await f.coordinator.receive(message('work'));
     const request = f.runtime.workers[0], tool = request.taskTools![0];
     const args = { operation: 'propose', slot: 'daily', mutation: modelCreate({ scheduleSpec: { kind: 'interval', anchorAt: Date.now() + HOUR_MS, intervalMs: HOUR_MS } }) };
     const proposal = await tool.execute(args) as { id: string; status: string };
@@ -300,7 +300,7 @@ describe('scheduled execution through the Coordinator', () => {
   });
 
   it('rejects Worker proposals after a live role revocation instead of persisting the promised task', async () => {
-    const f = fixture(); await f.coordinator.receive(message('work'));
+    const f = fixture(); f.runtime.ignoreAbort=true; await f.coordinator.receive(message('work'));
     const proposal = await f.runtime.workers[0].taskTools![0].execute({ operation: 'propose', slot: 'later', mutation: modelCreate() }) as { id: string };
     f.service.updatePolicy(ADMIN, ['group_admin'], f.service.readPolicy().version);
     f.runtime.complete(0, { scheduleProposalIds: [proposal.id] });
@@ -311,7 +311,7 @@ describe('scheduled execution through the Coordinator', () => {
   });
 
   it('lets the original requester withdraw a pending Worker proposal through Router before ready commits', async () => {
-    const f = fixture(); await f.coordinator.receive(message('work'));
+    const f = fixture(); f.runtime.ignoreAbort=true; await f.coordinator.receive(message('work'));
     const proposal = await f.runtime.workers[0].taskTools![0].execute({ operation: 'propose', slot: 'later', mutation: modelCreate() }) as { id: string };
     let proposals: any;
     f.runtime.decide = async (request, tools) => {
@@ -374,7 +374,7 @@ describe('scheduled execution through the Coordinator', () => {
   });
 
   it('discards an old Worker proposal after an attributed correction changes the thread revision', async () => {
-    const f = fixture(); await f.coordinator.receive(message('work'));
+    const f = fixture(); f.runtime.ignoreAbort=true; await f.coordinator.receive(message('work'));
     const request = f.runtime.workers[0];
     const proposal = await request.taskTools![0].execute({ operation: 'propose', slot: 'later', mutation: modelCreate() }) as { id: string };
     f.runtime.decide = next => [{ action: 'append_thread', sourceMessageIds: [next.messages[0].id], threadId: request.thread.id, kind: 'correction' }];
@@ -392,12 +392,11 @@ describe('scheduled execution through the Coordinator', () => {
     expect(f.runtime.workers[0].taskTools?.map(tool => tool.name)).toContain('scheduled_tasks');
     f.runtime.decide = request => [{ action: 'append_thread', sourceMessageIds: [request.messages[0].id], threadId, kind: 'supplement' }];
     await f.coordinator.receive(message('other', { authorId: '302', text: '助手，把这件事每天再做一次' }));
-    f.runtime.complete(0);
     await until(() => f.runtime.workers.length === 2, f.coordinator);
+    expect(f.runtime.workers[0].signal?.aborted).toBe(true);
     expect(f.runtime.workers[1].thread.ownerId).toBe('301');
     expect(f.runtime.workers[1].taskTools).toEqual([]);
     await f.coordinator.receive(message('owner-again', { text: '助手，我同意登记未来计划' }));
-    f.runtime.complete(1);
     await until(() => f.runtime.workers.length === 3, f.coordinator);
     expect(f.runtime.workers[2].taskTools?.map(tool => tool.name)).toContain('scheduled_tasks');
     expect(f.service.list(ADMIN).total).toBe(0);

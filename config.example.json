@@ -50,6 +50,10 @@
   "routerSessionMaxBytes": 4000000,
   "threadIdleTtlMs": 21600000,
   "maxWorkerSteps": 96,
+  "workerInputScheduling": {
+    "settleMs": 750,
+    "maxWaitMs": 3000
+  },
   "routerBatchWindowMs": 150,
   "routerBatchSize": 8,
   "qq": {

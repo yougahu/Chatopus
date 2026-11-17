@@ -1,3 +1,4 @@
+import {workerInputScheduling,type WorkerInputScheduling} from './worker-input-scheduling.js';
 import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve, join } from 'node:path';
@@ -44,6 +45,7 @@ export interface Config {
   memoryApiKey?:string;
   concurrency: number;
   workerTimeoutMs: number;
+  workerInputScheduling?:WorkerInputScheduling;
   routerTimeoutMs: number;
   routerTurnTimeoutMs?:number;
   routerQueueTimeoutMs?:number;
@@ -138,6 +140,7 @@ export function loadConfig(root = process.cwd(), overrides: Partial<Config> = {}
     },
     concurrency: disk.concurrency ?? 5,
     workerTimeoutMs: disk.workerTimeoutMs ?? 3_600_000,
+    workerInputScheduling:workerInputScheduling(disk.workerInputScheduling),
     routerTimeoutMs: disk.routerTimeoutMs ?? 30_000,
     routerTurnTimeoutMs: disk.routerTurnTimeoutMs ?? 120_000,
     routerQueueTimeoutMs: disk.routerQueueTimeoutMs ?? 180_000,
@@ -197,6 +200,7 @@ export function loadConfig(root = process.cwd(), overrides: Partial<Config> = {}
   for (const key of ['concurrency','workerTimeoutMs','routerTimeoutMs','routerContextChars','routerSessionMaxBytes','maxWorkerSteps','recentMessageLimit','threadCardLimit','threadIdleTtlMs','routerBatchSize'] as const) {
     if (!Number.isInteger(config[key]) || config[key] <= 0) throw new Error(`Invalid positive integer: ${key}`);
   }
+  config.workerInputScheduling=workerInputScheduling(config.workerInputScheduling);
   if(!Number.isInteger(config.routerBatchWindowMs)||config.routerBatchWindowMs<0)throw new Error('Invalid batch window');
   if(config.routerBatchSize>20)throw new Error('routerBatchSize must be at most 20');
   validateAgentPlugins(config.plugins??[]);

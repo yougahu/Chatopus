@@ -127,7 +127,7 @@ export class AdminServer {
           threads:db.prepare('SELECT status,count(*) AS n FROM threads GROUP BY status').all(),outbox:db.prepare('SELECT status,count(*) AS n FROM outbox GROUP BY status').all(),
           metrics:parseRows(db.prepare("SELECT * FROM telemetry WHERE kind='model' ORDER BY id DESC LIMIT 300").all()),
           // Acquisition fallback failures remain in the thread audit; only the final model input failure is an alert.
-          errors:parseRows(db.prepare("SELECT * FROM telemetry WHERE kind NOT IN ('model','model_call','image_receive','image_input','domain_tool','router_context_lifecycle','router_model_call','scheduled_task') OR (kind='scheduled_task' AND (json_extract(data,'$.data.status')='failed' OR json_extract(data,'$.event') IN ('failed','blocked'))) OR (kind='router_model_call' AND json_extract(data,'$.code') IS NOT NULL) OR (kind='image_input' AND json_extract(data,'$.status')='failed') ORDER BY id DESC LIMIT 30").all())};
+          errors:parseRows(db.prepare("SELECT * FROM telemetry WHERE kind NOT IN ('model','model_call','image_receive','image_input','domain_tool','router_context_lifecycle','router_model_call','scheduled_task','input_committed','run_started','run_supersede_requested','run_superseded','handoff_reply_queued','delivery_attempt_started','delivery_attempt_settled') OR (kind='delivery_attempt_settled' AND json_extract(data,'$.status') IN ('failed','unknown')) OR (kind='scheduled_task' AND (json_extract(data,'$.data.status')='failed' OR json_extract(data,'$.event') IN ('failed','blocked'))) OR (kind='router_model_call' AND json_extract(data,'$.code') IS NOT NULL) OR (kind='image_input' AND json_extract(data,'$.status')='failed') ORDER BY id DESC LIMIT 30").all())};
       }
       const offset=Math.max(0,Math.min(1_000_000,Number(url.searchParams.get('offset'))||0));
       const room=url.searchParams.get('room')??'';const status=url.searchParams.get('status')??'';
@@ -138,7 +138,7 @@ export class AdminServer {
       }
       if(url.pathname==='/api/messages')return parseRows(db.prepare('SELECT * FROM messages WHERE (?=\'\' OR room=?) AND (?=\'\' OR status=?) ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(room,room,status,status,offset));
       if(url.pathname==='/api/decisions')return parseRows(db.prepare('SELECT * FROM decisions ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(offset));
-      if(url.pathname==='/api/outbox')return parseRows(db.prepare('SELECT * FROM outbox WHERE (?=\'\' OR status=?) ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(status,status,offset));
+      if(url.pathname==='/api/outbox')return parseRows(db.prepare('SELECT * FROM outbox WHERE (?=\'\' OR status=?) ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(status,status,offset)).map(row=>({...row,deliveryEvents:parseRows(db.prepare("SELECT * FROM telemetry WHERE kind IN ('delivery_attempt_started','delivery_attempt_settled') AND json_extract(data,'$.outboxId')=? ORDER BY id DESC LIMIT 100").all(String(row.id))).reverse()}));
       if(url.pathname.startsWith('/api/threads/')){
         const id=decodeURIComponent(url.pathname.slice('/api/threads/'.length));
         return {thread:parseRows(db.prepare('SELECT * FROM threads WHERE id=?').all(id))[0],
@@ -171,7 +171,8 @@ export class AdminServer {
               AND json_type(data,'$.tool')='text' AND length(trim(json_extract(data,'$.tool')))>0
               AND previousStatus IN ('error','partial') AND json_extract(data,'$.status')='ok' THEN 1 ELSE 0 END) AS recoveredRetries
             FROM calls GROUP BY tool,category ORDER BY calls DESC`).all(id),
-          outbox:parseRows(db.prepare("SELECT * FROM outbox WHERE json_extract(data,'$.threadId')=? ORDER BY rowid").all(id))};
+          lifecycleEvents:parseRows(db.prepare("SELECT * FROM telemetry WHERE kind IN ('input_committed','run_started','run_supersede_requested','run_superseded','worker_cleanup_blocked','handoff_reply_queued','delivery_attempt_started','delivery_attempt_settled') AND json_extract(data,'$.threadId')=? ORDER BY id DESC LIMIT 200").all(id)).reverse(),
+          outbox:parseRows(db.prepare("SELECT * FROM outbox WHERE json_extract(data,'$.threadId')=? OR json_extract(data,'$.associationThreadId')=? ORDER BY rowid").all(id,id))};
       }
       throw new Error('Unknown endpoint');
     }finally{db.close();}
