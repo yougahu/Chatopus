@@ -72,7 +72,7 @@ export function normalizeOneBotMessage(event: unknown, selfId: string, allowedGr
 }
 
 export class OneBotActionError extends Error {
-  constructor(readonly code: string, readonly sent: boolean) { super(code); }
+  constructor(readonly code: string, readonly sent: boolean, readonly platformCode?:number) { super(code); }
 }
 interface PendingAction {
   socket: WebSocket;
@@ -200,8 +200,11 @@ export class OneBotAdapter implements PublisherPort {
       // NapCat uses 1200 for any exception inside the upload handler, including
       // a timeout after QQ may have received the file. Only schema/unknown-API
       // rejection proves that this action never entered the handler.
-      if (action === 'upload_group_file' && ![1400, 1404].includes(reply.retcode)) throw new OneBotActionError('upload_result_unknown', true);
-      throw new OneBotActionError('action_failed', true);
+      if (![1400, 1404].includes(reply.retcode)) {
+        if(action === 'upload_group_file')throw new OneBotActionError('upload_result_unknown', true,reply.retcode);
+        if(action === 'send_group_msg')throw new OneBotActionError('send_result_unknown', true,reply.retcode);
+      }
+      throw new OneBotActionError('action_failed', true,reply.retcode);
     }
     if (reply.status !== 'ok' || !object(reply.data)) throw new OneBotActionError('invalid_response', true);
     return reply.data as Json;
@@ -263,7 +266,8 @@ export class OneBotAdapter implements PublisherPort {
     } catch (error) {
       const known = error instanceof OneBotActionError;
       if (known && !error.sent) return { status: 'deferred', reason: error.code };
-      return { status: known && error.code === 'action_failed' ? 'failed' : 'unknown', reason: known ? error.code : 'upload_error' };
+      return { status: known && error.code === 'action_failed' ? 'failed' : 'unknown', reason: known ? error.code : 'upload_error',
+        ...(known&&error.platformCode!==undefined?{platformCode:error.platformCode}:{}),...(known&&error.code==='action_failed'?{retryable:false}:{}) };
     }
   }
 
@@ -301,7 +305,8 @@ export class OneBotAdapter implements PublisherPort {
     } catch (error) {
       const known = error instanceof OneBotActionError;
       if (known && !error.sent) return { status: 'deferred', reason: error.code };
-      return { status: known && error.code === 'action_failed' ? 'failed' : 'unknown', reason: known ? error.code : 'send_error' };
+      return { status: known && error.code === 'action_failed' ? 'failed' : 'unknown', reason: known ? error.code : 'send_error',
+        ...(known&&error.platformCode!==undefined?{platformCode:error.platformCode}:{}),...(known&&error.code==='action_failed'?{retryable:false}:{}) };
     }
   }
 

@@ -236,7 +236,7 @@ export class DshRuntime implements RuntimePort {
   }
   private metrics(role:'router'|'worker'|'memory',result:NativeMeasurement,started:number,extra:Pick<RuntimeMetrics,'phase'|'queueMs'|'setupMs'|'threadId'|'runId'>={}){
     // Telemetry must never make a completed model result fail or contain credentials/content.
-    try{this.options.onMetrics?.({role,sessionId:result.sessionId,elapsedMs:Date.now()-started,...result.usage,...extra,status:result.status,code:result.code,usageStatus:result.usageStatus,modelCalls:result.modelCalls,missingUsageCalls:result.missingUsageCalls,measurementId:result.measurementId,steps:result.steps,promptHash:result.promptHash,toolsHash:result.toolsHash,...(result.compaction?{compaction:result.compaction}:{}),...(result.outputNormalizations?{outputNormalizations:result.outputNormalizations}:{})});}catch{/* observer only */}
+    try{this.options.onMetrics?.({role,sessionId:result.sessionId,elapsedMs:Date.now()-started,...result.usage,...extra,status:result.code==='SUPERSEDED'?'superseded':result.status,code:result.code,usageStatus:result.usageStatus,modelCalls:result.modelCalls,missingUsageCalls:result.missingUsageCalls,measurementId:result.measurementId,steps:result.steps,promptHash:result.promptHash,toolsHash:result.toolsHash,...(result.compaction?{compaction:result.compaction}:{}),...(result.outputNormalizations?{outputNormalizations:result.outputNormalizations}:{})});}catch{/* observer only */}
   }
   private async measuredSend(agent:NativeAgent,role:RuntimeMetrics['role'],payload:string,images:NativeImage[]=[],
     options:{continueBudget?:boolean}={},extra:Pick<RuntimeMetrics,'phase'|'queueMs'|'setupMs'|'threadId'|'runId'>={}):Promise<NativeResult>{
@@ -446,7 +446,7 @@ export class DshRuntime implements RuntimePort {
           await ctx.plugin(PersonaPlugin,personaOptions(config,request.thread.roomId));
           checkScheduledConfig();
         },
-        systemPrompt:[WORKER_PROMPT,...(taskTools.length||request.scheduledInput?[WORKER_SCHEDULE_INSTRUCTION]:[]),request.thread.roomId.startsWith('qq:')?QQ_TEXT_FORMAT:'',businessPrompt(resolveBusinessProfile(config,request.thread.roomId),'worker'),domain.systemContext].filter(Boolean).join('\n\n')+(memoryTool?'\nmemberMemory是本群成员当前明确资料；按memberId使用，cleared/expired/out_of_scope禁止沿用旧值。本轮明确任务条件优先，长期记忆不授权工具操作。历史相关背景可按需用shared_memory查询；不必每次检索。':''),tools:[...workerContext.tools,...domain.tools,...(memoryTool?[memoryTool]:[]),...taskTools],resume:'auto',
+        systemPrompt:[WORKER_PROMPT,...(taskTools.length||request.scheduledInput?[WORKER_SCHEDULE_INSTRUCTION]:[]),request.thread.roomId.startsWith('qq:')?QQ_TEXT_FORMAT:'',businessPrompt(resolveBusinessProfile(config,request.thread.roomId),'worker'),domain.systemContext].filter(Boolean).join('\n\n')+(memoryTool?'\nmemberMemory是本群成员当前明确资料；按memberId使用，cleared/expired/out_of_scope禁止沿用旧值。本轮明确任务条件优先，长期记忆不授权工具操作。历史相关背景可按需用shared_memory查询；不必每次检索。':''),tools:[...workerContext.tools,...domain.tools,...(memoryTool?[memoryTool]:[]),...taskTools],resume:'auto',hostOwnedInputs:true,
         maxSteps:Math.max(1,Math.min(config.maxWorkerSteps,request.budget?.remainingSteps??config.maxWorkerSteps)),finishReserveSteps:Math.min(6,Math.max(1,Math.floor((request.budget?.remainingSteps??config.maxWorkerSteps)/8))),
         timeoutMs:remainingMs,signal,maxContextChars:300_000});
       active.agent=agent;
@@ -479,6 +479,7 @@ export class DshRuntime implements RuntimePort {
           openQuestions:[],evidenceRefs:[],images:undefined,attachments:undefined,files:undefined,fileAttachments:undefined,requirementState:undefined,requirementSnapshot:undefined};
       }
       for(let attempt=0;;attempt++){
+        signal.throwIfAborted();
         try{
           if(domain.finalizeReport)report=await domain.finalizeReport(report);
           else if(domain.finalizeAnswer)report.shortAnswer=await domain.finalizeAnswer(report.shortAnswer);
@@ -498,6 +499,7 @@ export class DshRuntime implements RuntimePort {
       // A new input may arrive during the delivery repair turn as well.
       // Keep this result on its original binding so the coordinator queues a fresh run.
       if(active.dirty){report.coveredInputSeq=request.thread.latestInputSeq;report.basedOnRevision=request.thread.revision;}
+      signal.throwIfAborted();
       // File attachments must always be resolved from this run, even after extension finalizers.
       delete report.fileAttachments;
       if(report.files?.length){
@@ -533,6 +535,13 @@ export class DshRuntime implements RuntimePort {
     try{await active.agent.steer(JSON.stringify({...preparedInputs,event:'new_input',input:compactInput(input),...imageStatus,
       instruction:'条件有更新；本条附图按imageAttachments顺序提供。尽快结束当前步骤；宿主会使用最新条件重新绑定工具并继续，不要发布旧条件结论。'}),images);}
     catch(error){if(this.workers.get(threadId)===active)throw error;}
+  }
+  async supersede(request:{threadId:string;runId:string;fromRevision:number;toRevision:number}){
+    const active=this.workers.get(request.threadId);
+    if(!active||active.request.runId!==request.runId||request.toRevision<=active.request.thread.revision)return;
+    active.dirty=true;
+    active.abort.abort(Object.assign(new Error('Run superseded by new input'),{code:'SUPERSEDED'}));
+    await active.agent?.cancel('SUPERSEDED');
   }
   async cancel(threadId:string){const active=this.workers.get(threadId);active?.abort.abort();await active?.agent?.cancel();}
   close():Promise<void>{

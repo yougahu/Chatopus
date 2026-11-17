@@ -129,3 +129,22 @@ it('requires missing original task conditions for a continuation and complete qu
  await recall.tool.execute({kind:'messages',id:old.id});
  expect(()=>recall.assertComplete([{action:'open_thread',sourceMessageIds:['room:current'],subject:'analysis',contextMessageIds:[old.id]}])).toThrow('unread');
 });
+
+it('projects persisted handoffs without metadata, future inputs or other rooms',async()=>{
+ const {store,old,current,request}=fixture();
+ const thread=store.createThread(old,'document',true,undefined,{routingContext:{resolvedRequest:'original '+ '条件'.repeat(800),sourceMessageIds:[old.id],contextMessageIds:[],contextReplyIds:[],routingMetadata:{privateValue:'must-not-leak'}}});
+ request.threads=[thread];const read=store.routerContextReader('room',current.id,3);
+ const future=message('future','future correction');store.ingest(future);store.append(thread,future,'correction',undefined,{routingContext:{resolvedRequest:'future-secret',sourceMessageIds:[future.id],contextMessageIds:[],contextReplyIds:[]}});
+ const foreign=message('foreign','foreign','other');store.ingest(foreign);const other=store.createThread(foreign,'foreign',true);
+ expect((await read({kind:'handoffs',id:other.id})).handoffs).toEqual([]);
+ await expect(read({kind:'handoffs'})).rejects.toThrow('exact thread');
+ const recall=createRouterRecall(request,read),action={action:'request_handoff' as const,threadId:thread.id,sourceMessageIds:[current.id]};
+ const first=await recall.tool.execute({kind:'handoffs',id:thread.id,limit:1}) as any;
+ expect(first.handoffs[0]).toMatchObject({seq:1,revision:1,nextTextOffset:1200});
+ expect(JSON.stringify(first)).not.toMatch(/must-not-leak|future-secret/);
+ expect(()=>recall.assertComplete([action])).toThrow('unread');
+ await recall.tool.execute({kind:'handoffs',id:thread.id,limit:1,textOffset:1200});
+ expect(()=>recall.assertComplete([action])).not.toThrow();
+ expect(parseRoutesForRequest(JSON.stringify([action]),request)).toEqual([action]);
+ expect(()=>parseRoutesForRequest(JSON.stringify([{...action,threadId:other.id}]),request)).toThrow();
+});

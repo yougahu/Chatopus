@@ -32,6 +32,40 @@ async function mount(adapter:LlmAdapter,root?:string){
   const runtime=await NativeAgentRuntime.create({root,adapters:{mock:adapter}});runtimes.push(runtime);return {runtime,root};
 }
 const model={provider:'mock',model:'test-model'};
+it('cancels a run then resumes the same conversation with one fresh followup and no old inbox replay',async()=>{
+ let entered!:()=>void;const entering=new Promise<void>(resolve=>entered=resolve);
+ const adapter=new ScriptAdapter(async(request,index)=>{
+   if(index===0)return toolResponse('resource_value');
+   if(index===1){entered();await new Promise<void>((_resolve,reject)=>request.signal!.addEventListener('abort',()=>reject(request.signal!.reason),{once:true}));}
+   return textResponse('continued');
+ });
+ const {runtime,root}=await mount(adapter);let tools=0;
+ const first=await runtime.start({id:'continue-owned',model,cwd:root,systemPrompt:'Worker',hostOwnedInputs:true,resume:'auto',
+   tools:[{name:'resource_value',description:'Read value',inputSchema:{type:'object'},execute:async()=>{tools++;return {value:42};}}]});
+ const sending=first.send('Original request: Node 20');const rejected=expect(sending).rejects.toMatchObject({code:'SUPERSEDED'});
+ await entering;await first.steer('obsolete pending inbox');await first.cancel('SUPERSEDED');await rejected;await first.dispose();
+ const resumed=await runtime.start({id:'continue-owned',model,cwd:root,systemPrompt:'Worker',hostOwnedInputs:true,resume:'auto'});
+ expect((await resumed.send('Correction: Node 22')).text).toBe('continued');
+ const context=JSON.stringify(adapter.requests.at(-1)!.messages);
+ expect(context).toContain('Original request: Node 20');expect(context).toContain('42');
+ expect(context.match(/Correction: Node 22/g)).toHaveLength(1);expect(context).not.toContain('obsolete pending inbox');expect(tools).toBe(1);
+ await resumed.dispose();
+});
+it('does not release a cancelled session until an uncooperative tool has settled',async()=>{
+ let entered!:()=>void,release!:()=>void;const entering=new Promise<void>(resolve=>entered=resolve),gate=new Promise<void>(resolve=>release=resolve);
+ const adapter=new ScriptAdapter((_request,index)=>index===0?toolResponse('slow_write'):textResponse('continued'));
+ const {runtime,root}=await mount(adapter);let calls=0;
+ const first=await runtime.start({id:'slow-owned',model,cwd:root,systemPrompt:'Worker',hostOwnedInputs:true,resume:'auto',tools:[{
+   name:'slow_write',description:'Synthetic delayed operation',inputSchema:{type:'object'},execute:async()=>{calls++;entered();await gate;return 'recorded';}}]});
+ const sending=first.send('Perform one operation');const rejected=expect(sending).rejects.toMatchObject({code:'SUPERSEDED'});
+ await entering;let released=false;const stopping=(async()=>{await first.cancel('SUPERSEDED');await first.dispose();released=true;})();
+ try{await new Promise(resolve=>setTimeout(resolve,20));expect(released).toBe(false);}finally{release();}
+ await stopping;await rejected;
+ const resumed=await runtime.start({id:'slow-owned',model,cwd:root,systemPrompt:'Worker',hostOwnedInputs:true,resume:'auto'});
+ await resumed.send('Report the observed outcome, do not repeat the operation');
+ expect(calls).toBe(1);expect(adapter.requests).toHaveLength(2);
+ await resumed.dispose();
+});
 it('retries inside a model step without replaying tools or retaining failed partial output',async()=>{
  const adapter=new ScriptAdapter((_request,index)=>{
   if(index===0)return [...toolResponse('resource_value').slice(0,-1),{type:'finish',reason:{kind:'error',failure:{code:'PI_AI_ERROR',message:'overloaded'}}}];

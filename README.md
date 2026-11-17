@@ -89,6 +89,7 @@ npm run setup -- --deploy-dir "$HOME/.local/share/chatopus"
 - [从零部署与运行](docs/deployment.md)：安装、配置、QQ 接入、常驻服务、备份、升级和排障。
 - [管理后台](docs/admin.md)：页面、数据源、配置入口、审计和用量。
 - [架构](docs/architecture.md)：Router、Worker、Coordinator、Thread、Outbox 和存储边界。
+- [任务追问与交付](docs/task-continuation.md)：查看交接、连续更正、取消恢复和投递边界。
 - [配置参考](docs/configuration.md)：模型、路径、环境变量、默认值和生效方式。
 - [QQ 平台](docs/platform.md)：OneBot 接入、消息、附件和投递。
 - [技能和工具](docs/skills.md)：外部 Skill、扩展、插件和浏览器能力。

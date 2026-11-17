@@ -1,7 +1,9 @@
+import {scheduleWorkerInputs,workerInputScheduling} from './worker-input-scheduling.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Config } from './config.js';
+import { taskHandoff } from './task-handoff.js';
 import { Store, type ResultRow, type OutboxRow } from './store.js';
 import { renderReplyLinks, assertLinkReferencesUnchanged } from './tools/reply-links.js';
 import { routeSchema, reportSchema, validateRouteActions, enforceReferenceThreads, ROUTER_REPLY_HISTORY_LIMIT } from './protocol.js';
@@ -29,7 +31,7 @@ interface PreferenceOutbox extends OutboxRow {hostMemberMemory?:MemberMemoryProj
 
 export class Coordinator {
   private roomLocks=new Map<string,Promise<unknown>>();
-  private active=new Map<string,{promise:Promise<void>;abort:AbortController}>();
+  private active=new Map<string,{promise:Promise<void>;abort:AbortController;supersededBy?:number}>();
   private resultActive=new Set<string>();
   private resultTasks=new Set<Promise<unknown>>();
   private dispatching=false;
@@ -327,6 +329,7 @@ export class Coordinator {
       for(const action of actions)if('sourceMessageIds'in action)for(const source of action.sourceMessageIds)bySource.set(source,action);
       const emitted=new Set<RouteAction>();const created=new Map<RouteAction,string>();
       const acknowledgements=new Map<string,{text:string;replyToMessageId:string}>();
+      const immediates=new Map<RouteAction,{threadId:string;through:number;source:GroupMessage;reply:NonNullable<Extract<RouteAction,{action:'append_thread'}>['immediateReply']>}>();
       const applied:RouteAction[]=[];
       const apply=()=>{
         const existingOutbox=new Set(this.store.outbox('pending').map(row=>row.id));
@@ -377,8 +380,20 @@ export class Coordinator {
               if(reference.status==='unbound')this.store.bindReferencedThread(message,thread.id,currentTime);
               acknowledgements.set(thread.id,{text:action.acknowledgement?.trim()||'我来核对一下这个问题，查清楚再回复你。',replyToMessageId:message.messageId});
             }
+            if(action.immediateReply){const id=created.get(action)!;immediates.set(originalAction,{threadId:id,through:this.store.thread(id)!.latestInputSeq,source:message,reply:action.immediateReply});}
           }else if('threadId' in action){
             const thread=this.store.thread(action.threadId)!;
+            if(action.action==='request_handoff'){
+              if(thread.scheduledTask)try{this.scheduledTasks.readThread(message,thread);}catch(error){
+                this.store.enqueue({roomId,replyToMessageId:message.messageId,text:this.taskError(error)},{id:'control:'+message.id});continue;
+              }
+              if(emitted.has(action))continue;emitted.add(action);
+              this.store.bindMessageThread(message,thread.id);
+              this.store.enqueue({roomId,replyToMessageId:message.messageId,text:taskHandoff(this.store,roomId,thread.id,message.id,action.view)},
+                {id:'handoff:'+message.id,kind:'handoff',associationThreadId:thread.id});
+              this.store.telemetry('handoff_reply_queued',{threadId:thread.id,sourceId:message.id,view:action.view??'current'});
+              continue;
+            }
             if(thread.scheduledTask){
               try{
                 if(action.action==='request_status'){
@@ -390,7 +405,7 @@ export class Coordinator {
                 }else if(action.action==='append_thread'){
                   this.scheduledTasks.assertThreadControl(message,thread);
                   const context=this.inputContext(message,action,request),followup=this.store.createThread(message,action.resolvedRequest??message.text,true,context.messages,context.metadata);
-                  created.set(action,followup.id);acknowledgements.set(followup.id,{text:action.acknowledgement?.trim()||'我接着核对这个问题。',replyToMessageId:message.messageId});
+                  created.set(action,followup.id);if(action.immediateReply)immediates.set(originalAction,{threadId:followup.id,through:followup.latestInputSeq,source:message,reply:action.immediateReply});acknowledgements.set(followup.id,{text:action.acknowledgement?.trim()||'我接着核对这个问题。',replyToMessageId:message.messageId});
                 }
               }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId,text:this.taskError(error)},{id:'control:'+message.id});}
               continue;
@@ -408,9 +423,12 @@ export class Coordinator {
               const needsAcknowledgement=!['queued','running'].includes(thread.status)||acknowledgements.has(thread.id)
                 ||this.store.outbox('pending').some(row=>row.kind==='acknowledgement'&&row.threadId===thread.id);
               const context=this.inputContext(message,action,request);
+              const previousSeq=thread.latestInputSeq;
               const input=this.store.append(thread,message,action.kind??'supplement',context.messages,context.metadata);
+              if(input.seq>previousSeq){thread.pendingInputs=scheduleWorkerInputs(thread.pendingInputs,input.seq,workerInputScheduling(this.config.workerInputScheduling));this.store.saveThread(thread);}
               if(reference.status==='unbound')this.store.bindReferencedThread(message,thread.id,currentTime);
               if(needsAcknowledgement)acknowledgements.set(thread.id,{text:action.acknowledgement?.trim()||'收到，我接着核对你补充的内容。',replyToMessageId:message.messageId});
+              if(action.immediateReply)immediates.set(originalAction,{threadId:thread.id,through:input.seq,source:message,reply:action.immediateReply});
               if(this.active.has(thread.id))steers.push({threadId:thread.id,input});
             }else if(action.action==='request_cancel'){
               const allowed=message.authorId===thread.ownerId||message.isAdmin;
@@ -422,6 +440,14 @@ export class Coordinator {
               this.store.enqueue({roomId,replyToMessageId:message.messageId,text:`这个问题当前状态：${({queued:'排队中',running:'正在处理',needs_input:'等待补充',idle:'已回答',failed:'处理失败',cancelled:'已停止'} as const)[thread.status]}。`},{id:'control:'+message.id,associationThreadId:thread.id});
             }
           }
+        }
+        for(const immediate of immediates.values()){
+          acknowledgements.delete(immediate.threadId);
+          for(const pending of this.store.outbox('pending'))if(pending.kind==='acknowledgement'&&pending.threadId===immediate.threadId){pending.status='stale';this.store.saveOutbox(pending);}
+          const text=immediate.reply.kind==='handoff'?taskHandoff(this.store,roomId,immediate.threadId,immediate.source.id,immediate.reply.view,immediate.through):immediate.reply.text;
+          this.store.enqueue({roomId,replyToMessageId:immediate.source.messageId,text},{id:'immediate:'+immediate.source.id,
+            kind:immediate.reply.kind==='handoff'?'handoff':'immediate',associationThreadId:immediate.threadId});
+          this.store.telemetry('handoff_reply_queued',{threadId:immediate.threadId,sourceId:immediate.source.id,throughInputSeq:immediate.through,kind:immediate.reply.kind});
         }
         // Use the final revision after every source in this batch is appended.
         for(const [threadId,ack]of acknowledgements){
@@ -456,12 +482,8 @@ export class Coordinator {
         }),{...databaseOptions,deadlineAt:prepared.turn.deadlineAt!});
 
       }else await retrySqliteBusy(()=>this.store.transaction(apply),databaseOptions);
-      // The input is durable before steering. Mark the runtime dirty immediately,
-      // but never hold the room routing lock while its new images download.
-      for(const x of steers)if(!cancels.has(x.threadId)){
-        const task=this.runtime.steer(x.threadId,x.input).catch(e=>this.error('steer',e)).finally(()=>this.steerTasks.delete(task));
-        this.steerTasks.add(task);
-      }
+      // New inputs are durable. Invalidate the owned run once, then use normal resume.
+      for(const threadId of new Set(steers.map(x=>x.threadId)))if(!cancels.has(threadId))this.continueThread(threadId);
       for(const id of cancels){this.active.get(id)?.abort.abort();await this.runtime.cancel(id).catch(e=>this.error('cancel',e));}
     });
     if(split&&!this.stopped){
@@ -475,6 +497,38 @@ export class Coordinator {
     // Use the platform ID of the covered input, not the thread origin, a quoted
     // context message, or newer room chatter. Persist this target in the outbox.
     return this.store.inputs(thread.id).find(input=>input.seq===inputSeq)?.message.messageId??thread.sourceMessageId;
+  }
+  private continueThread(threadId:string){
+    const owned=this.active.get(threadId),thread=this.store.thread(threadId);
+    if(!owned||!thread?.activeRunId||thread.status==='cancelled')return;
+    const runId=thread.activeRunId;
+    const row=this.store.db.prepare('SELECT data FROM runs WHERE id=?').get(runId);
+    const fromRevision=row?Number(JSON.parse(String(row.data)).revision):thread.revision;
+    if(fromRevision>=thread.revision)return;
+    if(row)this.store.saveRun(runId,threadId,'running',{...JSON.parse(String(row.data)),supersededByRevision:thread.revision});
+    if(owned.supersededBy){owned.supersededBy=thread.revision;return;}
+    owned.supersededBy=thread.revision;
+    this.store.telemetry('run_supersede_requested',{threadId,runId,fromRevision,toRevision:thread.revision});
+    // Abort reaches setup, model calls and tools, even before the runtime has registered an agent.
+    owned.abort.abort(Object.assign(new Error('Run superseded by new input'),{code:'SUPERSEDED'}));
+    const timer=setTimeout(()=>{
+      if(this.active.get(threadId)===owned)this.store.telemetry('worker_cleanup_blocked',{threadId,runId,toRevision:owned.supersededBy});
+    },5000);timer.unref();void owned.promise.finally(()=>clearTimeout(timer)).catch(()=>{});
+    const task=(this.runtime.supersede?.({threadId,runId,fromRevision,toRevision:thread.revision})??Promise.resolve())
+      .catch(error=>this.error('worker_supersede',error)).finally(()=>this.steerTasks.delete(task));
+    this.steerTasks.add(task);
+  }
+  /** Intake is persisted before route inference; a known quoted update gates publication. */
+  private hasUnresolvedThreadInput(thread:ThreadCard):boolean {
+    const rows=this.store.db.prepare("SELECT data FROM messages WHERE room=? AND status IN ('pending','processing','failed') AND json_type(data,'$.replyToMessageId')='text' ORDER BY rowid").all(thread.roomId);
+    const last=this.store.inputs(thread.id).at(-1);
+    const cutoff=last?Number(this.store.db.prepare('SELECT rowid FROM messages WHERE id=?').get(last.message.id)?.rowid??0):0;
+    return rows.some(row=>{
+      const message=JSON.parse(String(row.data)) as GroupMessage;
+      if(!hasWakeCandidate(message,this.config.botCallNames))return false;
+      const seq=Number(this.store.db.prepare('SELECT rowid FROM messages WHERE id=?').get(message.id)?.rowid??0);
+      return seq>cutoff&&this.store.resolveReference(message).threadId===thread.id;
+    });
   }
   private inputContext(message:GroupMessage,action:Extract<RouteAction,{action:'open_thread'|'append_thread'}>,request:RouterRequest) {
     // A reference is context for this input, not a new question or a change of ownership.
@@ -582,7 +636,7 @@ export class Coordinator {
   private async prepareReplyPreferences(original:OutboxRow,freeze:()=>boolean):Promise<boolean>{
     // Host receipts and failure notices must remain deliverable when the memory
     // backend or model is unavailable. Rewriting could also invert their status.
-    if(original.scheduleRunId||original.fileDeliveryNoticeFor||original.fileDeliveries?.some(file=>file.status==='sent')||['schedule-control:','memory-confirm:','route-failed:','worker-failed:','result-model-failed:'].some(prefix=>original.id.startsWith(prefix)))return freeze();
+    if(original.kind==='handoff'||original.scheduleRunId||original.fileDeliveryNoticeFor||original.fileDeliveries?.some(file=>file.status==='sent')||['schedule-control:','memory-confirm:','route-failed:','worker-failed:','result-model-failed:'].some(prefix=>original.id.startsWith(prefix)))return freeze();
     if(!this.runtime.sharedMemory)return freeze();
     const row=original as PreferenceOutbox,previous=row.hostMemberMemory??[];
     const target=row.message.replyToMessageId?this.store.db.prepare("SELECT data FROM messages WHERE room=? AND json_extract(data,'$.messageId')=? ORDER BY rowid DESC LIMIT 1").get(row.message.roomId,row.message.replyToMessageId) as {data:string}|undefined:undefined;
@@ -624,19 +678,18 @@ export class Coordinator {
     }
   }
   private registerSend(row:OutboxRow):boolean {
-    if(row.scheduleRunId)return this.store.transaction(()=>this.registerScheduledSend(row));
-    return this.registerScheduledSend(row);
+    return this.store.transaction(()=>this.registerScheduledSend(row));
   }
   private registerScheduledSend(row:OutboxRow):boolean {
     if(this.stopped)return false;
     if(!this.deliveryCurrent(row))return false;
     try{
       const template=row.hostLinkTemplate??row.message.text;
-      const rendered=renderReplyLinks(template,row.hostLinks,{threadId:row.threadId,revision:row.revision});
+      const rendered=row.kind==='handoff'?template:renderReplyLinks(template,row.hostLinks,{threadId:row.threadId,revision:row.revision});
       if(row.hostLinks?.length)row.hostLinkTemplate=template;
       row.message={...row.message,text:rendered};
     }catch(error){row.status='failed';row.reason='REPLY_LINK_INVALID';this.store.saveOutbox(row);if(row.scheduleRunId)this.scheduledTasks.delivery(row.scheduleRunId,'failed');this.error('reply_link_invalid',{outboxId:row.id});return false;}
-    row.status='sending';row.attempts++;this.store.saveOutbox(row);
+    row.status='sending';row.attempts++;row.deliveryAttemptId=randomUUID();this.store.saveOutbox(row);this.store.deliveryAttempt(row,'started');
     if(row.scheduleRunId)this.scheduledTasks.delivery(row.scheduleRunId,'sending');
     return true;
   }
@@ -651,6 +704,8 @@ export class Coordinator {
       const thread=this.store.thread(row.threadId);
       const stale=!thread||thread.revision!==row.revision||(row.kind==='acknowledgement'
         ?!['queued','running'].includes(thread.status):thread.status==='cancelled'||thread.epoch!==row.epoch);
+      if(!stale&&row.kind!=='acknowledgement'&&this.hasUnresolvedThreadInput(thread!)){row.reason='related_input_unresolved';this.store.saveOutbox(row);return false;}
+      if(row.reason==='related_input_unresolved')delete row.reason;
       if(stale){row.status='stale';this.store.saveOutbox(row);if(row.scheduleRunId)this.scheduledTasks.delivery(row.scheduleRunId,'stale');return false;}
     }
     return true;
@@ -666,7 +721,7 @@ export class Coordinator {
     const fair=this.config.concurrency===1&&this.lastWorkerWasScheduled?[...immediate,...scheduled]:[...scheduled,...immediate];
     for(const thread of fair) {
       if(this.active.size>=this.config.concurrency)break;
-      if(this.active.has(thread.id))continue;
+      if(this.active.has(thread.id)||thread.pendingInputs&&thread.pendingInputs.readyAt>Date.now()||this.hasUnresolvedThreadInput(thread))continue;
       if(thread.scheduledTask){
         if(!this.scheduleExecution)continue;
         const limit=Math.min(this.config.scheduledTasks?.concurrency??1,Math.max(1,this.config.concurrency-1));
@@ -691,11 +746,16 @@ export class Coordinator {
   private async run(threadId:string,abort:AbortController) {
     const thread=this.store.thread(threadId)!;
     if(!this.scheduledTasks.start(thread)){thread.status='cancelled';thread.epoch++;this.store.saveThread(thread);return;}
+    delete thread.pendingInputs;
     const runId='r-'+randomUUID();thread.status='running';thread.activeRunId=runId;thread.epoch++;
     if(thread.workerBudget?.revision!==thread.revision)thread.workerBudget={revision:thread.revision,remainingSteps:this.config.maxWorkerSteps,deadlineAt:Date.now()+Math.min(this.config.workerTimeoutMs,this.scheduledTasks.timeout(thread)??Infinity)};
-    const epoch=thread.epoch;this.store.saveThread(thread);
-    this.recordTaskEvent(thread.id);
-    this.store.saveRun(runId,threadId,'running',{epoch,revision:thread.revision,budget:thread.workerBudget});
+    const epoch=thread.epoch,startedAt=Date.now();
+    const runData={epoch,revision:thread.revision,throughInputSeq:thread.latestInputSeq,budget:thread.workerBudget,startedAt};
+    this.store.transaction(()=>{
+      this.store.saveThread(thread);this.recordTaskEvent(thread.id);
+      this.store.saveRun(runId,threadId,'running',runData);
+      this.store.telemetry('run_started',{threadId,runId,...runData});
+    });
     const workspace=join(this.config.stateDir,'workspaces',threadId,runId);mkdirSync(workspace,{recursive:true,mode:0o700});
     try {
       if(thread.workerBudget.remainingSteps<=0)throw Object.assign(new Error('Worker step budget exhausted'),{code:'STEP_LIMIT'});
@@ -712,10 +772,10 @@ export class Coordinator {
       if(report.threadId!==threadId||report.runId!==runId||report.coveredInputSeq>current.latestInputSeq||report.basedOnRevision>current.revision)throw new Error('Worker report identity or version mismatch');
       this.store.transaction(()=>{
         if(!this.scheduledTasks.valid(current))return;
-        if(report.coveredInputSeq<current.latestInputSeq||report.basedOnRevision<current.revision){this.scheduledTasks.rejectWorker(thread,runId,'superseded');current.activeRunId=undefined;current.status='queued';this.store.saveThread(current);return;}
+        if(current.revision!==thread.revision||current.latestInputSeq!==thread.latestInputSeq||this.active.get(threadId)?.supersededBy||report.coveredInputSeq<current.latestInputSeq||report.basedOnRevision<current.revision){this.store.saveRun(runId,threadId,'superseded',{...runData,endedAt:Date.now(),supersededByRevision:current.revision});this.store.telemetry('run_superseded',{threadId,runId,fromRevision:thread.revision,toRevision:current.revision});this.scheduledTasks.rejectWorker(thread,runId,'superseded');current.activeRunId=undefined;current.status='queued';this.store.saveThread(current);return;}
         if(report.status==='ready')this.scheduledTasks.commitWorker(current,runId,report);
         else this.scheduledTasks.rejectWorker(thread,runId,report.status);
-        this.store.saveRun(runId,threadId,'completed',{epoch,report});current.activeRunId=undefined;
+        this.store.saveRun(runId,threadId,'completed',{...runData,endedAt:Date.now(),report});current.activeRunId=undefined;
         current.status=report.status==='needs_input'?'needs_input':report.status==='failed'?'failed':'idle';
         current.lastFailure=undefined;
         current.summary=report.shortAnswer.slice(0,700);this.store.saveThread(current);
@@ -725,11 +785,18 @@ export class Coordinator {
       });
     }catch(e){
       if(this.stopped)return;
-      this.scheduledTasks.rejectWorker(thread,runId,'run_failed');
       const current=this.store.thread(threadId)!;
+      if(this.active.get(threadId)?.supersededBy||current.revision>thread.revision){
+        this.scheduledTasks.rejectWorker(thread,runId,'superseded');
+        const steps=(e as {workerProgress?:{steps?:number}})?.workerProgress?.steps??0;
+        this.store.saveRun(runId,threadId,'superseded',{...runData,endedAt:Date.now(),supersededByRevision:current.revision,steps});
+        if(current.activeRunId===runId&&current.epoch===epoch&&current.status!=='cancelled'){current.activeRunId=undefined;current.status='queued';this.store.saveThread(current);}
+        this.store.telemetry('run_superseded',{threadId,runId,fromRevision:thread.revision,toRevision:current.revision,steps});this.recordTaskEvent(threadId);return;
+      }
+      this.scheduledTasks.rejectWorker(thread,runId,'run_failed');
       const code=routerErrorCode(e),measured=(e as {workerProgress?:{steps?:number}})?.workerProgress?.steps;
       const steps=Number.isSafeInteger(measured)&&measured!>=0?Math.min(measured!,thread.workerBudget.remainingSteps):0;
-      this.store.saveRun(runId,threadId,'failed',{epoch,revision:thread.revision,code,steps,error:this.safeError(e),budget:thread.workerBudget});
+      this.store.saveRun(runId,threadId,'failed',{...runData,endedAt:Date.now(),code,steps,error:this.safeError(e)});
       if(current.epoch!==epoch||current.status==='cancelled')return;
       if(code==='SCHEDULE_CONFIG_CHANGED'&&current.scheduledTask){
         this.scheduledTasks.service.block(current.scheduledTask.scheduleId,'execution_config_changed',{cancelRunning:true});
@@ -893,9 +960,9 @@ export class Coordinator {
         const delivery=row.fileDeliveries[index];
         if(delivery.status==='sent')continue;
         if(this.stopped)return {status:'deferred',reason:'service_stopping'};
-        if(!this.deliveryCurrent(row))return;
-        delivery.status='sending';delivery.attempts++;delete delivery.reason;
-        this.store.saveOutbox(row);
+        if(!this.deliveryCurrent(row))return row.status==='sending'&&row.reason==='related_input_unresolved'?{status:'deferred',reason:row.reason}:undefined;
+        delivery.status='sending';delivery.attempts++;delivery.attemptId=randomUUID();delete delivery.reason;
+        this.store.transaction(()=>{this.store.saveOutbox(row);this.store.deliveryAttempt(row,'started',undefined,file.artifactId,delivery.attemptId,delivery.attempts);});
         let receipt:SendReceipt;
         try{receipt=await this.publisher.uploadFile(row.message.roomId,file,`${row.id}:file:${file.artifactId}`);}
         catch{receipt={status:'unknown',reason:'file_upload_error'};}
@@ -904,11 +971,11 @@ export class Coordinator {
         delivery.reason=receipt.reason;delivery.platformFileId=receipt.platformFileId;
         delivery.sentAt=receipt.status==='sent'?Date.now():undefined;
         // Persist each confirmed file before starting the next platform action.
-        this.store.saveOutbox(row);
+        this.store.transaction(()=>{this.store.saveOutbox(row);this.store.deliveryAttempt(row,'settled',receipt,file.artifactId,delivery.attemptId,delivery.attempts+(receipt.status==='deferred'?1:0));});
         if(receipt.status!=='sent')return receipt;
       }
       if(this.stopped)return {status:'deferred',reason:'service_stopping'};
-      if(!this.deliveryCurrent(row))return;
+      if(!this.deliveryCurrent(row))return row.status==='sending'&&row.reason==='related_input_unresolved'?{status:'deferred',reason:row.reason}:undefined;
     }
     const {files:_,...message}=row.message;
     if(files.length&&!message.text.trim()&&!message.attachments?.length&&!message.recipientIds?.length)return {status:'sent'};
@@ -938,15 +1005,15 @@ export class Coordinator {
       if(!await this.prepareReplyPreferences(row,()=>this.registerSend(row)))continue;
       let receipt;
       try{receipt=await this.deliverMessage(row);}catch{receipt={status:'unknown' as const,reason:'send raised after registration'};}
-      if(!receipt)continue;
+      if(!receipt){this.store.deliveryAttempt(row,'settled',{status:'deferred',reason:'stale_before_next_action'});continue;}
       row.status=receipt.status;
       if(receipt.status==='deferred'){
         row.attempts--;row.status='pending';row.dueAt=Date.now()+5000;
       }
-      if(receipt.status==='failed'&&row.attempts<3){row.status='pending';row.dueAt=Date.now()+row.attempts*1000;}
+      if(receipt.status==='failed'&&receipt.retryable!==false&&row.attempts<3){row.status='pending';row.dueAt=Date.now()+row.attempts*1000;}
       Object.assign(row,{platformMessageId:receipt.platformMessageId,reason:receipt.reason,sentAt:receipt.status==='sent'?Date.now():undefined});
       this.store.transaction(()=>{
-        if(receipt.status==='failed'&&row.attempts<3&&row.kind==='acknowledgement'&&row.threadId){
+        if(receipt.status==='failed'&&receipt.retryable!==false&&row.attempts<3&&row.kind==='acknowledgement'&&row.threadId){
           const thread=this.store.thread(row.threadId);
           // New input can arrive while a send awaits its receipt. Only a definite
           // failure permits replacing that obsolete confirmation and trying again.
@@ -958,6 +1025,7 @@ export class Coordinator {
           }
         }
         this.store.saveOutbox(row);
+        this.store.deliveryAttempt(row,'settled',receipt,'message',row.deliveryAttemptId,row.attempts+(receipt.status==='deferred'?1:0));
         this.enqueueFileDeliveryNotice(row);
         if(row.scheduleRunId)this.scheduledTasks.delivery(row.scheduleRunId,row.status);
         if(this.persistentRouter&&this.store.routerSessions.session(row.message.roomId))this.store.routerSessions.appendEvent({roomId:row.message.roomId,sourceId:`delivery:${row.id}:${row.attempts}:${row.status}`,

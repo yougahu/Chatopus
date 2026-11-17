@@ -2,7 +2,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import { parseRoutesForRequest } from '../protocol.js';
 import type { RouterRequest } from '../types.js';
 
-const actionNames=new Set(['silence','reply_direct','clarify','open_thread','append_thread','request_status','request_cancel','manage_schedule','publish_result','defer_result']);
+const actionNames=new Set(['silence','reply_direct','clarify','open_thread','append_thread','request_status','request_handoff','request_cancel','manage_schedule','publish_result','defer_result']);
 
 /** Accept only complete JSON objects separated by whitespace, never prose or a partial tail. */
 function objectSequence(text:string):unknown[]|undefined {

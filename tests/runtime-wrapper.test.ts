@@ -357,3 +357,31 @@ it('emits exactly one failed repair measurement when the shared step budget is e
  expect(metrics[0]).toMatchObject({role:'worker',threadId:'t1',runId:'run1',status:'completed',usageStatus:'unknown',modelCalls:1});
  expect(metrics[1]).toMatchObject({role:'worker',threadId:'t1',runId:'run1',phase:'repair',status:'failed',code:'STEP_LIMIT',usageStatus:'not_called',modelCalls:0});
 });
+
+it.each(['setup','model'] as const)('supersedes during %s and resumes with fresh capability bindings on the same session',async stage=>{
+ let entered!:()=>void;const entering=new Promise<void>(resolve=>entered=resolve);
+ const metrics:any[]=[],bindings:any[]=[],closed:string[]=[];
+ let runtime!:DshRuntime;
+ const waitForAbort=async(signal:AbortSignal)=>{entered();await new Promise<void>((_resolve,reject)=>{signal.addEventListener('abort',()=>reject(signal.reason),{once:true});});};
+ const adapter=new Adapter(async(call)=>{
+  const {payload}=currentInput(call);
+  if(payload.runId==='run1'){await waitForAbort(call.signal!);throw new Error('old request must not complete');}
+  expect(payload.runId).toBe('run2');expect(payload.revision).toBe(2);
+  expect(JSON.stringify(payload.inputs)).toContain('Node 22');
+  await runtime.supersede({threadId:'t1',runId:'run1',fromRevision:1,toRevision:2});
+  call.signal?.throwIfAborted();
+  return JSON.stringify({...report,runId:'run2',coveredInputSeq:2,basedOnRevision:2});
+ });
+ const f=await fixture(adapter,8,undefined,{onMetrics:metric=>metrics.push(metric),capabilityFactory:async(_config,context)=>{
+  if(context.runId==='run2')expect(closed).toEqual(['run1']);bindings.push({runId:context.runId,revision:context.revision});
+  return {tools:[],systemContext:'Synthetic capability',prepareInputs:async(_inputs,signal)=>{if(stage==='setup'&&context.runId==='run1')await waitForAbort(signal!);return {};},close:async()=>{closed.push(context.runId);}};
+ }});runtime=f.runtime;
+ const first=workerRequest(f.root),running=runtime.runWorker(first),rejected=expect(running).rejects.toMatchObject({code:'SUPERSEDED'});
+ await entering;await runtime.supersede({threadId:'t1',runId:'run1',fromRevision:1,toRevision:2});await rejected;
+ const next={...first,runId:'run2',workspace:join(f.root,'worker-next'),thread:{...first.thread,revision:2,latestInputSeq:2,epoch:2},inputs:[...first.inputs,{seq:2,revision:2,kind:'correction' as const,message:{...message,id:'m2',messageId:'2',text:'Use Node 22'}}]};
+ expect(await runtime.runWorker(next)).toMatchObject({runId:'run2',basedOnRevision:2,coveredInputSeq:2});
+ expect(bindings).toEqual([{runId:'run1',revision:1},{runId:'run2',revision:2}]);expect(closed).toEqual(['run1','run2']);
+ expect(metrics[0]).toMatchObject({runId:'run1',code:'SUPERSEDED',status:'superseded'});
+ expect(adapter.requests).toHaveLength(stage==='model'?2:1);
+ if(stage==='model')expect(adapter.requests[0].sessionId).toBe(adapter.requests[1].sessionId);
+});

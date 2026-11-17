@@ -41,6 +41,8 @@ export interface NativeAgentOptions {
   systemPrompt: string;
   tools?: ToolDefinition[];
   resume?: boolean | 'auto';
+  /** Host owns durable Worker inputs; pending native inbox entries must not replay. */
+  hostOwnedInputs?:boolean;
   maxSteps?: number;
   /** Reserve the last steps for an honest, bounded handoff rather than new research. */
   finishReserveSteps?:number;
@@ -73,7 +75,7 @@ export interface NativeResult {
   toolsHash?:string;
   outputNormalizations?:number;
   compaction?: { summaries: number; prunedResults: number; inputTokens: number; outputTokens: number };
-  status?:'completed'|'failed';
+  status?:'completed'|'failed'|'superseded';
   code?:string;
   usageStatus?:'known'|'partial'|'unknown'|'not_called';
   modelCalls?:number;
@@ -201,6 +203,7 @@ export class NativeAgentRuntime {
     if (!/^[a-zA-Z0-9_-]{1,180}$/.test(options.id)) throw new NativeRuntimeError('INVALID_ID', 'Invalid session identity');
     await mkdir(resolve(options.cwd), { recursive: true, mode: 0o700 });
     let steps = 0;
+    const inFlightTools=new Set<Promise<unknown>>();
     const maxSteps = options.maxSteps ?? 30;
     if (!Number.isSafeInteger(maxSteps) || maxSteps < 1) throw new NativeRuntimeError('INVALID_LIMIT', 'maxSteps must be positive');
     const contextLimit = options.maxContextBytes ?? options.maxContextChars ?? 240_000;
@@ -258,9 +261,14 @@ export class NativeAgentRuntime {
               ...value.images.map(attachment => ({ type: 'image' as const, attachment }))];
           } },
           execute: async (args, exec) => {
-            const value = await tool.execute(args, exec.signal);
-            exec.signal.throwIfAborted();
-            return projectToolImages(this.ctx, value);
+            options.signal?.throwIfAborted();exec.signal.throwIfAborted();
+            const pending=Promise.resolve().then(async()=>{
+              options.signal?.throwIfAborted();exec.signal.throwIfAborted();
+              const value=await tool.execute(args,exec.signal);exec.signal.throwIfAborted();
+              return projectToolImages(this.ctx,value);
+            });
+            inFlightTools.add(pending);
+            try{return await pending;}finally{inFlightTools.delete(pending);}
           },
         });
       }
@@ -276,6 +284,7 @@ export class NativeAgentRuntime {
       const inputSize=(messages:readonly {role?:string;content:unknown}[])=>options.maxContextBytes===undefined
         ?JSON.stringify(messages).length:messages.reduce((total,message)=>total+contentBytes(message.content)+32,0);
       ctx.on('agent/pre-step', async (payload, next) => {
+        options.signal?.throwIfAborted();payload.signal.throwIfAborted();
         const inputChars = inputSize(payload.messages);
         // Pending inputs are not yet in the session: never summarize or silently
         // truncate a new question which cannot fit even with no history.
@@ -325,13 +334,14 @@ export class NativeAgentRuntime {
         } else throw error;
       }
     } else handle = await this.ctx.agents.create({ ...common, meta: { cwd: resolve(options.cwd) } });
+    if(options.hostOwnedInputs)handle.agent.cancel({kind:'user'},{keepInbox:false});
     // A configured model choice applies to this run even when history is restored.
     handle.agent.model.select({ provider: options.model.provider, model: options.model.model, ...(options.model.reasoningEffort ? { reasoningEffort: ReasoningEffortId(options.model.reasoningEffort) } : {}) });
     normalization.sessionId=handle.agent.session.id;
     if(options.execution)this.executions.set(handle.agent.session.id,options.execution);
     const calls:NativeModelCall[]=[];
     this.modelObservers.set(handle.agent.session.id,call=>{const observed={...call,measurementId:agent.measurementId,step:steps};calls.push(observed);try{options.onModelCall?.(observed);}catch{/* observation only */}});
-    const agent = new NativeAgent(this.ctx, handle, {...options,id:handle.agent.session.id}, () => { steps = 0; }, () => {this.agents.delete(options.id);this.executions.delete(handle.agent.session.id);this.modelObservers.delete(handle.agent.session.id);release();},()=>normalization.count,()=>calls,()=>Math.min(steps,maxSteps));
+    const agent = new NativeAgent(this.ctx, handle, {...options,id:handle.agent.session.id}, () => { steps = 0; }, () => {this.agents.delete(options.id);this.executions.delete(handle.agent.session.id);this.modelObservers.delete(handle.agent.session.id);release();},()=>normalization.count,()=>calls,()=>Math.min(steps,maxSteps),async()=>{await Promise.allSettled([...inFlightTools]);});
     this.agents.set(options.id, agent);
     return agent;
   }
@@ -389,7 +399,7 @@ export class NativeAgent {
   constructor(private readonly ctx: Context, private readonly handle: AgentHandle,
     private readonly options: NativeAgentOptions, private readonly resetSteps: () => void,
     private readonly onDispose: () => void,private readonly outputNormalizationCount:()=>number=()=>0,
-    private readonly modelCalls:()=>readonly NativeModelCall[]=()=>[],private readonly stepCount:()=>number=()=>0) {}
+    private readonly modelCalls:()=>readonly NativeModelCall[]=()=>[],private readonly stepCount:()=>number=()=>0,private readonly settleTools:()=>Promise<void>=async()=>{}) {}
 
   get sessionId(): string { return this.options.id; }
   get measurementId():string|undefined {return this.measurementKey;}
@@ -414,14 +424,14 @@ export class NativeAgent {
     const stepStart=this.usedSteps;
     const normalizedBefore=this.outputNormalizationCount();
     let timer:ReturnType<typeof setTimeout>|undefined,result:NativeResult|undefined,code:string|undefined;
-    const cancel = () => { this.abortReason = 'ABORTED'; this.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }); };
+    const cancel = () => { this.abortReason = signal?.reason?.code==='SUPERSEDED'?'SUPERSEDED':'ABORTED'; this.handle.agent.cancel({ kind: 'user' }, { keepInbox: !this.options.hostOwnedInputs }); };
     try {
       signal?.throwIfAborted();
       const content: ContentBlock[] = [{ type: 'text', text }];
       for (const attachment of await this.ctx.attachments.saveImages(images)) content.push({ type: 'image', attachment });
       signal?.throwIfAborted();
       signal?.addEventListener('abort', cancel, { once: true });
-      timer = setTimeout(() => { this.abortReason = 'TIMEOUT'; this.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }); }, this.options.timeoutMs ?? 180_000);
+      timer = setTimeout(() => { this.abortReason = 'TIMEOUT'; this.handle.agent.cancel({ kind: 'user' }, { keepInbox: !this.options.hostOwnedInputs }); }, this.options.timeoutMs ?? 180_000);
       await this.handle.agent.followup(createUserMessage({ content, source: { kind: 'user' } }));
       await this.handle.agent.whenIdle();
       await this.ctx.sessions.flush(this.handle.agent.session);
@@ -443,7 +453,7 @@ export class NativeAgent {
       }
       const missingUsageCalls=calls.filter(call=>!call.usage).length;
       this.lastMeasurement={measurementId:this.measurementKey,sessionId:this.sessionId,eventCount:this.handle.agent.session.snapshotEvents().length-start,
-        usage,status:result?'completed':'failed',code,modelCalls:calls.length,missingUsageCalls,steps:this.usedSteps-stepStart,
+        usage,status:result?'completed':code==='SUPERSEDED'?'superseded':'failed',code,modelCalls:calls.length,missingUsageCalls,steps:this.usedSteps-stepStart,
         usageStatus:!calls.length?'not_called':missingUsageCalls===calls.length?'unknown':missingUsageCalls?'partial':'known',
         ...(result?{promptHash:result.promptHash,toolsHash:result.toolsHash,compaction:result.compaction,outputNormalizations:result.outputNormalizations}:{})};
       if(result)Object.assign(result,this.lastMeasurement);
@@ -465,9 +475,9 @@ export class NativeAgent {
   wait(): Promise<NativeResult> {
     return this.active ?? Promise.reject(new NativeRuntimeError('NO_RUN', 'Agent has no pending run'));
   }
-  async cancel(): Promise<void> {
-    this.abortReason = 'ABORTED';
-    this.handle.agent.cancel({ kind: 'user' }, { keepInbox: true });
+  async cancel(reason='ABORTED'): Promise<void> {
+    this.abortReason = reason;
+    this.handle.agent.cancel({ kind: 'user' }, { keepInbox: !this.options.hostOwnedInputs });
     await this.handle.agent.whenIdle();
     await this.ctx.sessions.flush(this.handle.agent.session);
   }
@@ -475,7 +485,7 @@ export class NativeAgent {
     if (this.disposed) return;
     this.disposed = true;
     this.abortReason = 'DISPOSED';
-    try { await this.handle.dispose(); } finally { this.onDispose(); }
+    try { await this.handle.dispose(); } finally { try{await this.settleTools();}finally{this.onDispose();} }
   }
 }
 

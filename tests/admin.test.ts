@@ -208,3 +208,17 @@ it('shows durable Router recovery counters and failed-summary usage without flag
  expect(overview.errors.some((row:{kind:string})=>row.kind==='router_context_lifecycle')).toBe(false);
  expect(overview.errors.some((row:{kind:string})=>row.kind==='router_model_call')).toBe(true);
 });
+
+it('separates routine continuation events from alerts and exposes delivery attempts',async()=>{
+ const {store,url}=await setup();
+ for(const kind of ['input_committed','run_started','run_supersede_requested','run_superseded','handoff_reply_queued','delivery_attempt_started'])store.telemetry(kind,{threadId:'t',outboxId:'reply'});
+ store.telemetry('delivery_attempt_settled',{threadId:'t',outboxId:'reply',status:'sent'});
+ store.telemetry('delivery_attempt_settled',{threadId:'t',outboxId:'reply',status:'unknown',platformCode:1200,reason:'send_result_unknown'});
+ store.telemetry('worker_cleanup_blocked',{threadId:'t'});
+ store.enqueue({roomId:'room',text:'handoff'},{id:'reply',kind:'handoff',associationThreadId:'t'});
+ const overview=await(await fetch(url+'/api/overview')).json();
+ expect(overview.errors.map((event:any)=>event.kind)).toEqual(['worker_cleanup_blocked','delivery_attempt_settled']);
+ const rows=await(await fetch(url+'/api/outbox')).json();expect(rows[0].deliveryEvents).toHaveLength(3);
+ const detail=await(await fetch(url+'/api/threads/t')).json();expect(detail.outbox).toHaveLength(1);
+ expect(detail.lifecycleEvents.some((event:any)=>event.kind==='run_superseded')).toBe(true);
+});

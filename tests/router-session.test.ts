@@ -266,7 +266,12 @@ describe('fresh Router sessions through the real dsh runtime', () => {
   });
 
   it('keeps repeated room requests bounded without accumulating history or invoking compaction', async () => {
-    const { runtime, adapter } = await fixture(new RouterAdapter(), { routerContextChars: 16_000 });
+    class BoundedAdapter extends RouterAdapter {
+      override async resolveModel(provider:string,model:string):Promise<LlmResolvedModelInfo>{
+        return {provider,id:model,name:model,context:{contextWindow:65_536}};
+      }
+    }
+    const { runtime, adapter } = await fixture(new BoundedAdapter(), { routerContextChars: 20_000 });
     for (let i = 0; i < 12; i++) await runtime.route(request('room', `message-${i}`, `ORIGINAL_NOTE_${i} ` + 'detailed earlier observation '.repeat(110)));
     expect(adapter.requests).toHaveLength(12);
     expect(new Set(adapter.requests.map(call => call.sessionId)).size).toBe(12);

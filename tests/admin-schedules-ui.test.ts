@@ -81,7 +81,7 @@ describe('scheduled tasks admin UI',()=>{
  it('escapes schedule content, preserves user ownership and separates delivery from execution',async()=>{
    const own={...schedule,authority:'user',ownerId:'member-A',content:'<img src=x onerror=evil()>'};
    const app=setup((path)=>path.includes('/runs?')?{value:{items:[{id:'run-1',status:'succeeded',scheduledAt:Date.now(),outbox:[{status:'unknown',data:{message:{text:'<script>bad()</script>'}}}]}],total:1,hasMore:false}}:path.includes('/schedules/s-test')?{value:{schedule:own}}:undefined);
-   await app.run("showSchedule('s-test')");expect(app.document.querySelector('#detail-body img')).toBeNull();expect(app.document.querySelector('#detail-body script')).toBeNull();expect(app.input('#detail-body').textContent).toContain('用户任务 · member-A');expect(app.input('#detail-body').textContent).toContain('送达未知');
+   await app.run("showSchedule('s-test')");expect(app.document.querySelector('#detail-body img')).toBeNull();expect(app.document.querySelector('#detail-body script')).toBeNull();expect(app.input('#detail-body').textContent).toContain('用户任务 · member-A');expect(app.input('#detail-body').textContent).toContain('发送结果待确认');
    app.click('[data-schedule-op=update]');expect(app.input('[name=roomId]').disabled).toBe(true);expect(app.input('#detail-body').textContent).toContain('级别和请求人保持不变');
  });
  it('requires a visible confirmation before cancelling and reports a queued command honestly',async()=>{

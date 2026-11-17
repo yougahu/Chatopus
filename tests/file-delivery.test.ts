@@ -132,3 +132,18 @@ it('rejects excessive combined file bytes before attempting uploads',async()=>{
   const f=fixture(),first=f.file('one.md');f.queue([1,2,3].map(index=>({...first,artifactId:'file-'+index,name:index+'.md',bytes:8*1024*1024})));
   await f.coordinator.tick();expect(f.row().reason).toBe('invalid_output_file');expect(f.publisher.uploads).toHaveLength(0);expect(f.publisher.messages).toHaveLength(0);
 });
+
+it('pauses between confirmed files for an unresolved quote and resumes without reuploading',async()=>{
+ const f=fixture();f.store.ingest(message);f.store.messageStatus(message.id,'routed');
+ const thread=f.store.createThread(message,'Translation',true);thread.status='idle';f.store.saveThread(thread);
+ const update={...message,id:ROOM+':2',messageId:'2',replyToMessageId:message.messageId,text:'请展示已经保存的交接内容'};
+ f.store.enqueue({roomId:ROOM,text:'translated',files:[f.file('one.md'),f.file('two.md')]},{id:'delivery',threadId:thread.id,revision:thread.revision,epoch:thread.epoch});
+ f.publisher.onUpload=async file=>{if(file.name==='one.md'){f.store.ingest(update);f.store.messageStatus(update.id,'processing');}return {status:'sent',platformFileId:file.name};};
+ await f.coordinator.tick();
+ expect(f.row()).toMatchObject({status:'pending',reason:'related_input_unresolved',attempts:0});
+ expect(f.publisher.uploads.map(item=>item.file.name)).toEqual(['one.md']);expect(f.publisher.messages).toHaveLength(0);
+ const events=f.store.db.prepare("SELECT data FROM telemetry WHERE kind='delivery_attempt_settled' ORDER BY id").all().map(row=>JSON.parse(String(row.data)));
+ expect(events).toEqual(expect.arrayContaining([expect.objectContaining({status:'sent',part:'one.md'}),expect.objectContaining({status:'deferred',reason:'related_input_unresolved'})]));
+ f.store.messageStatus(update.id,'routed');f.due();await f.coordinator.tick();
+ expect(f.row().status).toBe('sent');expect(f.publisher.uploads.map(item=>item.file.name)).toEqual(['one.md','two.md']);expect(f.publisher.messages).toHaveLength(1);
+});
