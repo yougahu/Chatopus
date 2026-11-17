@@ -1,0 +1,1259 @@
+{
+  "version": 2,
+  "description": "16个领域无关的合成群聊场景；图片仅为路由占位。旧领域回放已迁出宿主。",
+  "scenarios": [
+    {
+      "id": "generic-01",
+      "title": "普通闲聊",
+      "tags": [
+        "闲聊",
+        "静默"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-01:generic-01-1",
+          "platform": "replay",
+          "roomId": "replay:generic-01",
+          "messageId": "generic-01-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "今天下班好晚",
+          "timestamp": 1700000000000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-01:generic-01-2",
+          "platform": "replay",
+          "roomId": "replay:generic-01",
+          "messageId": "generic-01-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "我也刚到家",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-01:generic-01-3",
+          "platform": "replay",
+          "roomId": "replay:generic-01",
+          "messageId": "generic-01-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "明天见",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-01:generic-01-1",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-01:generic-01-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-01:generic-01-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-02",
+      "title": "招呼与收尾",
+      "tags": [
+        "招呼"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-02:generic-02-1",
+          "platform": "replay",
+          "roomId": "replay:generic-02",
+          "messageId": "generic-02-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "你好，助手",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-02:generic-02-2",
+          "platform": "replay",
+          "roomId": "replay:generic-02",
+          "messageId": "generic-02-2",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "今天天气真好",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-02:generic-02-3",
+          "platform": "replay",
+          "roomId": "replay:generic-02",
+          "messageId": "generic-02-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "谢谢，助手",
+          "timestamp": 1700000002000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-02:generic-02-1",
+          "actions": [
+            "reply_direct"
+          ]
+        },
+        {
+          "messageId": "replay:generic-02:generic-02-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-02:generic-02-3",
+          "actions": [
+            "silence",
+            "reply_direct"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-03",
+      "title": "给定前提的简单推理",
+      "tags": [
+        "简单推理"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-03:generic-03-1",
+          "platform": "replay",
+          "roomId": "replay:generic-03",
+          "messageId": "generic-03-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，如果每箱有12支笔，3箱有多少支？",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-03:generic-03-2",
+          "platform": "replay",
+          "roomId": "replay:generic-03",
+          "messageId": "generic-03-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "我猜是36",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-03:generic-03-3",
+          "platform": "replay",
+          "roomId": "replay:generic-03",
+          "messageId": "generic-03-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "对，谢谢",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-03:generic-03-1",
+          "actions": [
+            "reply_direct"
+          ]
+        },
+        {
+          "messageId": "replay:generic-03:generic-03-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-03:generic-03-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-04",
+      "title": "检索任务与有效补充",
+      "tags": [
+        "专业",
+        "补充"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-04:generic-04-1",
+          "platform": "replay",
+          "roomId": "replay:generic-04",
+          "messageId": "generic-04-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，查一下图书馆这周末的开放时间，提供官网依据。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-04:generic-04-2",
+          "platform": "replay",
+          "roomId": "replay:generic-04",
+          "messageId": "generic-04-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "可能下午开门",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-04:generic-04-3",
+          "platform": "replay",
+          "roomId": "replay:generic-04",
+          "messageId": "generic-04-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，我说的是市中心分馆。",
+          "timestamp": 1700000002000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-04-1"
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-04:generic-04-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-04:generic-04-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-04:generic-04-3",
+          "actions": [
+            "append_thread"
+          ],
+          "threadFrom": "replay:generic-04:generic-04-1"
+        }
+      ]
+    },
+    {
+      "id": "generic-05",
+      "title": "纠正已明确对象",
+      "tags": [
+        "专业",
+        "更正"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-05:generic-05-1",
+          "platform": "replay",
+          "roomId": "replay:generic-05",
+          "messageId": "generic-05-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，对照一下第一版和第二版说明书的安装要求。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-05:generic-05-2",
+          "platform": "replay",
+          "roomId": "replay:generic-05",
+          "messageId": "generic-05-2",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，更正：我需要比较第二版和第三版，别再查第一版。",
+          "timestamp": 1700000001000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-05-1"
+        },
+        {
+          "id": "replay:generic-05:generic-05-3",
+          "platform": "replay",
+          "roomId": "replay:generic-05",
+          "messageId": "generic-05-3",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "第三版包装好看",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-05:generic-05-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-05:generic-05-2",
+          "actions": [
+            "append_thread"
+          ],
+          "threadFrom": "replay:generic-05:generic-05-1"
+        },
+        {
+          "messageId": "replay:generic-05:generic-05-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-06",
+      "title": "取消任务",
+      "tags": [
+        "专业",
+        "取消"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-06:generic-06-1",
+          "platform": "replay",
+          "roomId": "replay:generic-06",
+          "messageId": "generic-06-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，帮我查一下这款打印机的耗材规格。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-06:generic-06-2",
+          "platform": "replay",
+          "roomId": "replay:generic-06",
+          "messageId": "generic-06-2",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，不用查了，停止这个任务。",
+          "timestamp": 1700000001000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-06-1"
+        },
+        {
+          "id": "replay:generic-06:generic-06-3",
+          "platform": "replay",
+          "roomId": "replay:generic-06",
+          "messageId": "generic-06-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "我找到了",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-06:generic-06-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-06:generic-06-2",
+          "actions": [
+            "request_cancel"
+          ],
+          "threadFrom": "replay:generic-06:generic-06-1"
+        },
+        {
+          "messageId": "replay:generic-06:generic-06-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-07",
+      "title": "不同作者的新请求",
+      "tags": [
+        "专业",
+        "多人"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-07:generic-07-1",
+          "platform": "replay",
+          "roomId": "replay:generic-07",
+          "messageId": "generic-07-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，我预算500元，请查一下适合阅读的台灯。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-07:generic-07-2",
+          "platform": "replay",
+          "roomId": "replay:generic-07",
+          "messageId": "generic-07-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "助手，我另外需要1000元以内的键盘，请帮我比较。",
+          "timestamp": 1700000001000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-07:generic-07-3",
+          "platform": "replay",
+          "roomId": "replay:generic-07",
+          "messageId": "generic-07-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，我的台灯要能调色温。",
+          "timestamp": 1700000002000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-07-1"
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-07:generic-07-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-07:generic-07-2",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-07:generic-07-3",
+          "actions": [
+            "append_thread"
+          ],
+          "threadFrom": "replay:generic-07:generic-07-1"
+        }
+      ]
+    },
+    {
+      "id": "generic-08",
+      "title": "跨作者明确引用",
+      "tags": [
+        "专业",
+        "多人",
+        "引用"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-08:generic-08-1",
+          "platform": "replay",
+          "roomId": "replay:generic-08",
+          "messageId": "generic-08-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，查一下会议室预订流程。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-08:generic-08-2",
+          "platform": "replay",
+          "roomId": "replay:generic-08",
+          "messageId": "generic-08-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "助手，也核对一下这个流程里取消预订的步骤。",
+          "timestamp": 1700000001000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-08-1"
+        },
+        {
+          "id": "replay:generic-08:generic-08-3",
+          "platform": "replay",
+          "roomId": "replay:generic-08",
+          "messageId": "generic-08-3",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "我上周用过那间",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-08:generic-08-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-08:generic-08-2",
+          "actions": [
+            "append_thread"
+          ],
+          "threadFrom": "replay:generic-08:generic-08-1"
+        },
+        {
+          "messageId": "replay:generic-08:generic-08-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-09",
+      "title": "明确读图与普通晒图",
+      "tags": [
+        "图片",
+        "专业"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-09:generic-09-1",
+          "platform": "replay",
+          "roomId": "replay:generic-09",
+          "messageId": "generic-09-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [
+            {
+              "kind": "image",
+              "file": "synthetic-routing-image.png"
+            }
+          ],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-09:generic-09-2",
+          "platform": "replay",
+          "roomId": "replay:generic-09",
+          "messageId": "generic-09-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "这张照片不错",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [
+            {
+              "kind": "image",
+              "file": "synthetic-routing-image.png"
+            }
+          ],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-09:generic-09-3",
+          "platform": "replay",
+          "roomId": "replay:generic-09",
+          "messageId": "generic-09-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，帮我读一下第一张图上右上角的数字。",
+          "timestamp": 1700000002000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-09-1"
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-09:generic-09-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-09:generic-09-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-09:generic-09-3",
+          "actions": [
+            "append_thread"
+          ],
+          "threadFrom": "replay:generic-09:generic-09-1"
+        }
+      ]
+    },
+    {
+      "id": "generic-10",
+      "title": "必要信息缺失",
+      "tags": [
+        "澄清"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-10:generic-10-1",
+          "platform": "replay",
+          "roomId": "replay:generic-10",
+          "messageId": "generic-10-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，帮我查一下它在哪。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-10:generic-10-2",
+          "platform": "replay",
+          "roomId": "replay:generic-10",
+          "messageId": "generic-10-2",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "就是那个东西",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-10:generic-10-3",
+          "platform": "replay",
+          "roomId": "replay:generic-10",
+          "messageId": "generic-10-3",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "大家有看到吗",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-10:generic-10-1",
+          "actions": [
+            "clarify"
+          ]
+        },
+        {
+          "messageId": "replay:generic-10:generic-10-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-10:generic-10-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-11",
+      "title": "先发图后明确求助",
+      "tags": [
+        "图片",
+        "专业"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-11:generic-11-1",
+          "platform": "replay",
+          "roomId": "replay:generic-11",
+          "messageId": "generic-11-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "这份说明书",
+          "timestamp": 1700000000000,
+          "mentions": [],
+          "attachments": [
+            {
+              "kind": "image",
+              "file": "synthetic-routing-image.png"
+            }
+          ],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-11:generic-11-2",
+          "platform": "replay",
+          "roomId": "replay:generic-11",
+          "messageId": "generic-11-2",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，帮我读一下刚才说明书里的保修条件。",
+          "timestamp": 1700000001000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-11-1"
+        },
+        {
+          "id": "replay:generic-11:generic-11-3",
+          "platform": "replay",
+          "roomId": "replay:generic-11",
+          "messageId": "generic-11-3",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "这份说明书很长",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-11:generic-11-1",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-11:generic-11-2",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-11:generic-11-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-12",
+      "title": "当前消息必须独立唤起",
+      "tags": [
+        "专业",
+        "静默"
+      ],
+      "split": "development",
+      "messages": [
+        {
+          "id": "replay:generic-12:generic-12-1",
+          "platform": "replay",
+          "roomId": "replay:generic-12",
+          "messageId": "generic-12-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，查一下明天展览的入口和开门时间。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-12:generic-12-2",
+          "platform": "replay",
+          "roomId": "replay:generic-12",
+          "messageId": "generic-12-2",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "顺便看看停车场",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-12:generic-12-3",
+          "platform": "replay",
+          "roomId": "replay:generic-12",
+          "messageId": "generic-12-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，再补充停车场入口位置。",
+          "timestamp": 1700000002000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-12-1"
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-12:generic-12-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-12:generic-12-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-12:generic-12-3",
+          "actions": [
+            "append_thread"
+          ],
+          "threadFrom": "replay:generic-12:generic-12-1"
+        }
+      ]
+    },
+    {
+      "id": "generic-13",
+      "title": "要求安静不扩展任务",
+      "tags": [
+        "取消",
+        "静默"
+      ],
+      "split": "holdout",
+      "messages": [
+        {
+          "id": "replay:generic-13:generic-13-1",
+          "platform": "replay",
+          "roomId": "replay:generic-13",
+          "messageId": "generic-13-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，帮我核对会议日程。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-13:generic-13-2",
+          "platform": "replay",
+          "roomId": "replay:generic-13",
+          "messageId": "generic-13-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "助手，没问你这件事，先别插话。",
+          "timestamp": 1700000001000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-13:generic-13-3",
+          "platform": "replay",
+          "roomId": "replay:generic-13",
+          "messageId": "generic-13-3",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "我明天晚一点到",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-13:generic-13-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-13:generic-13-2",
+          "actions": [
+            "reply_direct",
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-13:generic-13-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-14",
+      "title": "状态查询",
+      "tags": [
+        "专业",
+        "状态"
+      ],
+      "split": "holdout",
+      "messages": [
+        {
+          "id": "replay:generic-14:generic-14-1",
+          "platform": "replay",
+          "roomId": "replay:generic-14",
+          "messageId": "generic-14-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，比较两份公开报告的主要差异。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-14:generic-14-2",
+          "platform": "replay",
+          "roomId": "replay:generic-14",
+          "messageId": "generic-14-2",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，这个任务进行到哪了？",
+          "timestamp": 1700000001000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-14-1"
+        },
+        {
+          "id": "replay:generic-14:generic-14-3",
+          "platform": "replay",
+          "roomId": "replay:generic-14",
+          "messageId": "generic-14-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "我先去吃饭",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-14:generic-14-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-14:generic-14-2",
+          "actions": [
+            "request_status"
+          ],
+          "threadFrom": "replay:generic-14:generic-14-1"
+        },
+        {
+          "messageId": "replay:generic-14:generic-14-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-15",
+      "title": "谈论助手不是呼唤",
+      "tags": [
+        "静默"
+      ],
+      "split": "holdout",
+      "messages": [
+        {
+          "id": "replay:generic-15:generic-15-1",
+          "platform": "replay",
+          "roomId": "replay:generic-15",
+          "messageId": "generic-15-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "这个助手怎么样",
+          "timestamp": 1700000000000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-15:generic-15-2",
+          "platform": "replay",
+          "roomId": "replay:generic-15",
+          "messageId": "generic-15-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "助手又插嘴了",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-15:generic-15-3",
+          "platform": "replay",
+          "roomId": "replay:generic-15",
+          "messageId": "generic-15-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "让助手以后安静点",
+          "timestamp": 1700000002000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-15:generic-15-1",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-15:generic-15-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-15:generic-15-3",
+          "actions": [
+            "silence"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic-16",
+      "title": "有限范围不扩大需求",
+      "tags": [
+        "专业",
+        "范围"
+      ],
+      "split": "holdout",
+      "messages": [
+        {
+          "id": "replay:generic-16:generic-16-1",
+          "platform": "replay",
+          "roomId": "replay:generic-16",
+          "messageId": "generic-16-1",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，只帮我核对附录A和附录B是否需要签名。",
+          "timestamp": 1700000000000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-16:generic-16-2",
+          "platform": "replay",
+          "roomId": "replay:generic-16",
+          "messageId": "generic-16-2",
+          "authorId": "B",
+          "authorName": "B",
+          "text": "应该不用全部打印",
+          "timestamp": 1700000001000,
+          "mentions": [],
+          "attachments": [],
+          "isMentioned": false,
+          "isAdmin": false
+        },
+        {
+          "id": "replay:generic-16:generic-16-3",
+          "platform": "replay",
+          "roomId": "replay:generic-16",
+          "messageId": "generic-16-3",
+          "authorId": "A",
+          "authorName": "A",
+          "text": "助手，只查签名，不需要分析整个申请流程。",
+          "timestamp": 1700000002000,
+          "mentions": [
+            "bot"
+          ],
+          "attachments": [],
+          "isMentioned": true,
+          "isAdmin": false,
+          "replyToMessageId": "generic-16-1"
+        }
+      ],
+      "expected": [
+        {
+          "messageId": "replay:generic-16:generic-16-1",
+          "actions": [
+            "open_thread"
+          ]
+        },
+        {
+          "messageId": "replay:generic-16:generic-16-2",
+          "actions": [
+            "silence"
+          ]
+        },
+        {
+          "messageId": "replay:generic-16:generic-16-3",
+          "actions": [
+            "append_thread"
+          ],
+          "threadFrom": "replay:generic-16:generic-16-1"
+        }
+      ]
+    }
+  ]
+}

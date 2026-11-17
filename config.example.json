@@ -1,0 +1,79 @@
+{
+  "stateDir": "~/.local/share/chatopus/runtime",
+  "router": {
+    "provider": "boe-router",
+    "model": "YOUR_MODEL_ID",
+    "api": "openai-responses",
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKeyEnv": "ROUTER_API_KEY",
+    "reasoningEffort": "low",
+    "maxTokens": 1200
+  },
+  "worker": {
+    "provider": "boe-worker",
+    "model": "YOUR_MODEL_ID",
+    "api": "openai-responses",
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKeyEnv": "WORKER_API_KEY",
+    "reasoningEffort": "high",
+    "maxTokens": 16000
+  },
+  "botCallNames": [
+    "\u52a9\u624b",
+    "\u673a\u5668\u4eba"
+  ],
+  "plugins": [],
+  "scheduledTasks": {
+    "enabled": false,
+    "defaultTimezone": "Asia/Shanghai",
+    "minIntervalMs": 3600000,
+    "scanIntervalMs": 1000,
+    "concurrency": 1
+  },
+  "persistentRouter": true,
+  "memory": {
+    "enabled": false,
+    "provider": "openviking",
+    "baseUrl": "http://127.0.0.1:1933",
+    "namespace": "chat-assistant",
+    "rootKeyEnv": "OPENVIKING_ROOT_API_KEY",
+    "timeoutMs": 15000,
+    "recallBytes": 6000,
+    "ingestBatchSize": 32,
+    "ingestBatchWindowMs": 300000,
+    "fields": []
+  },
+  "concurrency": 5,
+  "workerTimeoutMs": 3600000,
+  "routerTimeoutMs": 30000,
+  "routerContextChars": 48000,
+  "routerSessionMaxBytes": 4000000,
+  "threadIdleTtlMs": 21600000,
+  "maxWorkerSteps": 96,
+  "routerBatchWindowMs": 150,
+  "routerBatchSize": 8,
+  "qq": {
+    "enabled": false,
+    "allowedGroupIds": [],
+    "port": 8083
+  },
+  "business": {
+    "defaultProfile": "default",
+    "roomProfiles": {},
+    "profiles": {
+      "default": {
+        "name": "\u901a\u7528\u52a9\u624b",
+        "commonInstructions": "",
+        "routerInstructions": "",
+        "workerInstructions": "",
+        "skillIds": [],
+        "extensionIds": [],
+        "memoryFields": []
+      }
+    }
+  },
+  "skills": [],
+  "extensions": [],
+  "routerTurnTimeoutMs": 120000,
+  "routerQueueTimeoutMs": 180000
+}

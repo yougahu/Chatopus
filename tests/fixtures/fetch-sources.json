@@ -1,0 +1,92 @@
+[
+  {
+    "name": "Synthetic HTTP 404 case 1",
+    "url": "https://example.test/sources/1",
+    "status": 404,
+    "contentType": "text/html",
+    "title": "Page unavailable",
+    "text": "Page not found.",
+    "expected": "error",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 200 case 2",
+    "url": "https://example.test/sources/2",
+    "status": 200,
+    "contentType": "text/html; charset=UTF-8",
+    "title": "Document service release notes",
+    "text": "The document service supports text and table exports. This synthetic sample checks that readable article content is preserved with its source URL. Revision 3 adds a preview option and improves file search.",
+    "expected": "ok",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 403 case 3",
+    "url": "https://example.test/sources/3",
+    "status": 403,
+    "contentType": "text/html",
+    "title": "Just a moment...",
+    "text": "Verify you are human.",
+    "expected": "error",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 403 case 4",
+    "url": "https://example.test/sources/4",
+    "status": 403,
+    "contentType": "text/html",
+    "title": "Just a moment...",
+    "text": "Verify you are human.",
+    "expected": "error",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 403 case 5",
+    "url": "https://example.test/sources/5",
+    "status": 403,
+    "contentType": "text/html",
+    "title": "Just a moment...",
+    "text": "Verify you are human.",
+    "expected": "error",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 403 case 6",
+    "url": "https://example.test/sources/6",
+    "status": 403,
+    "contentType": "text/html",
+    "title": "Just a moment...",
+    "text": "Verify you are human.",
+    "expected": "error",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 403 case 7",
+    "url": "https://example.test/sources/7",
+    "status": 403,
+    "contentType": "text/html",
+    "title": "Just a moment...",
+    "text": "Verify you are human.",
+    "expected": "error",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 403 case 8",
+    "url": "https://example.test/sources/8",
+    "status": 403,
+    "contentType": "text/html",
+    "title": "Just a moment...",
+    "text": "Verify you are human.",
+    "expected": "error",
+    "synthetic": true
+  },
+  {
+    "name": "Synthetic HTTP 403 case 9",
+    "url": "https://example.test/sources/9",
+    "status": 403,
+    "contentType": "text/html",
+    "title": "Just a moment...",
+    "text": "Verify you are human.",
+    "expected": "error",
+    "synthetic": true
+  }
+]

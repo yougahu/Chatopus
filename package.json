@@ -1,0 +1,95 @@
+{
+  "name": "chatopus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted group-chat agent inspired by DeepSeek Super-agent architecture",
+  "engines": {
+    "node": "^22.16.0 || >=24.0.0"
+  },
+  "scripts": {
+    "setup": "node scripts/install.mjs",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:python": "python3 -m unittest tests.openviking_install_test tests.openviking_serve_test tests.openviking_memory_guard_test.SourceGuardTest",
+    "dev": "tsx src/cli.ts",
+    "doctor": "tsx src/cli.ts doctor",
+    "replay": "tsx src/cli.ts replay",
+    "start": "tsx src/cli.ts serve",
+    "admin": "tsx src/cli.ts admin",
+    "check:public": "node scripts/check-public-files.mjs",
+    "check:release": "npm run check && npm test && npm run test:python && npm run notices:check && npm run check:public",
+    "notices:write": "node scripts/third-party-notices.mjs --write",
+    "notices:check": "node scripts/third-party-notices.mjs --check",
+    "smoke:defaults": "node scripts/smoke-defaults.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-agent-loop": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-attachment-local": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-compaction-basic": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-compaction-tool-result-pruner": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-home-paths": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-scope": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-token-meter": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@modelcontextprotocol/sdk": "^1.25.0",
+    "ipaddr.js": "2.5.0",
+    "linkedom": "^0.18.15",
+    "undici": "7.30.2",
+    "ws": "^8.18.3",
+    "yaml": "^2.8.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.8"
+  },
+  "overrides": {
+    "zod": "$zod"
+  },
+  "files": [
+    "src/**/*.{ts,js,css,html,py}",
+    "scripts/**/*.{ts,mjs,py,yaml}",
+    "tests/**/*.{ts,mjs,py,json}",
+    "fixtures/*.{ts,json,png}",
+    "personas/default.md",
+    "personas/concise.md",
+    "personas/friendly.md",
+    "docs/*.md",
+    "docs/assets/*.png",
+    "AGENTS.md",
+    "config.example.json",
+    ".env.example",
+    "tsconfig.json",
+    "vitest.config.ts",
+    "LICENSE",
+    "ACKNOWLEDGEMENTS.md",
+    "THIRD_PARTY_NOTICES.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yougahu/Chatopus.git"
+  },
+  "homepage": "https://github.com/yougahu/Chatopus#readme",
+  "bugs": {
+    "url": "https://github.com/yougahu/Chatopus/issues"
+  }
+}

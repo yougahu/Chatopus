@@ -1,0 +1,24 @@
+{
+  "memory_type": "events",
+  "description": "Only a concrete consequential commitment, arrangement, progress, or result worth future recall. No ordinary questions, banter, friend requests, or chat-as-an-event. Copy ONE complete source statement VERBATIM. No synthesis, assistant facts, third-party quotations, jokes, or role-play. Empty results are expected when nothing qualifies. Do not update or delete older records.",
+  "directory": "viking://user/{{ user_space }}/memories/events",
+  "filename_template": "fact_{{ ranges }}.md",
+  "enabled": true,
+  "peer_enabled": true,
+  "operation_mode": "add_only",
+  "embedding_template": "{{ content }}",
+  "fields": [
+    {
+      "name": "content",
+      "type": "string",
+      "merge_op": "replace",
+      "description": "One complete exact quote (4-600 characters) from ONE user message. Preserve negation, conditions and intent. No rewriting, title, assistant text or inferred facts."
+    },
+    {
+      "name": "ranges",
+      "type": "string",
+      "merge_op": "replace",
+      "description": "Exactly ONE user message index, e.g. \"3\". No ranges, commas or assistant messages."
+    }
+  ]
+}
