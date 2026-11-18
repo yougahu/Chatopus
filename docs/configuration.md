@@ -49,6 +49,12 @@
 | `routerQueueTimeoutMs` | `180000` | 持续 Router 从消息入库开始的排队/处理截止时限 |
 | `routerContextChars` | `48000` | 模型容量缺失时的上下文回退参数，不是本轮原文上限 |
 | `routerSessionMaxBytes` | `4000000` | 触发 Router 物理会话日志换代的大小阈值，不是历史日志总磁盘配额 |
+| `routerCompaction.maxTokens` | `16384` | 摘要请求输出上限，与普通 `router.maxTokens` 分开；范围 1—16384 |
+| `routerCompaction.thresholdRatio` | `0.8` | 与 dsh 官方默认一致：按工作窗口的 80% 触发压力检查，还需扣除输出预留与压缩余量 |
+| `routerCompaction.headroomTokens` | `65536` | 与 dsh 官方默认一致：普通请求输出预留之外的压缩余量 |
+| `routerCompaction.retainRatio` | `0.16` | 与 dsh 官方默认一致：逐字保留可用输入窗口的 16%，边界保持消息与工具配对完整 |
+| `routerCompaction.thresholdTokens` | 不设置 | 可选绝对压力上限，用于部署主动缩小工作集 |
+| `routerCompaction.contextTokens` | 模型窗口 | 可选工作上下文上限，含当前输入和输出预留；字节保护为有效窗口的四倍 |
 | `recentMessageLimit` | `16` | 普通最近消息窗口 |
 | `threadCardLimit` | `12` | 普通任务卡窗口；必要引用另行固定 |
 | `threadIdleTtlMs` | `21600000` | 话题空闲时长阈值，6 小时 |
@@ -59,6 +65,14 @@
 Coordinator 为同一任务版本维护固定的 Worker 截止时间，默认从首次启动起一小时，后续重试和格式修复共享这段时间及步骤预算，不因为重试延长。定时 Worker 采用 `workerTimeoutMs` 与该任务 `timeoutMs` 的较小值；超时和取消使结果失效，不保证每次运行都能完成固定次数的重试。持续 Router 使用自身的 turn 截止时间。
 
 `workerInputScheduling` 只影响追加输入后的继续执行，首条任务立即进入调度。须满足 `0 <= settleMs <= maxWaitMs <= 10000`；均为 0 时关闭额外合批等待。连续输入在最后一次输入后等待 `settleMs`，最多从第一条待处理输入起等待 `maxWaitMs`。输入和等待边界均持久化；这段等待不包含路由耗时、旧运行退出或并发排队。详见 [任务追问与交付](task-continuation.md)。
+
+`routerCompaction` 在后续调用热更新，已开始的调用保持原策略。省略绝对容量配置时，工作窗口 `W` 就是模型声明的上下文容量；设置 `contextTokens` 时取两者的较小值。普通输出预留为 `O`，实际压力门槛为 `floor(min(W × thresholdRatio, W − O − headroomTokens, thresholdTokens（若设置）))`，近期原文保留量为 `floor((W − O) × retainRatio)`。默认容量策略与 dsh 官方一致，摘要输出仍单独限制为 16384。容量未知时沿用 `routerContextChars` 的保守回退。
+
+`thresholdRatio`、`retainRatio` 必须在 0 与 1 之间，且保留比例小于触发比例；`headroomTokens` 为非负整数。可选的 `thresholdTokens/contextTokens` 为大于 8000、至多 1048576 的整数，同时设置时前者必须小于后者。解析模型后，预留必须留有正数输入空间，保留量必须小于实际压力门槛，否则明确报错。小窗口模型需显式降低余量，例如 32k 窗口配 `{"headroomTokens":4096}`；不会悄悄改写官方默认值。
+
+较大窗口可减少摘要频率，也会增加普通路由输入。需要缩小工作集时可设置 `{"maxTokens":16384,"thresholdTokens":96000,"contextTokens":128000,"headroomTokens":16384}`。字节保护可能先于 token 门槛触发压缩。删除整个配置项会回到进程启动时的设置；恢复动态默认容量时请显式填写 `{"maxTokens":16384,"thresholdRatio":0.8,"headroomTokens":65536,"retainRatio":0.16}`。
+
+摘要以未决事项、当前约束和来源索引为主，长度由继续工作所需的信息决定，不设置固定 token 目标、条目数量或句数；`maxTokens` 是请求输出预算，不是目标长度。摘要截断后最多进行一次重组恢复，优先合并重复背景和已完成流程，仍失败则保留先前有效检查点。放宽摘要目标长度不保证减少压缩频率；工作窗口、压缩后的实际大小和新增输入共同决定下一次触发时机。降低输出预算不能替代事实保留与召回验证。
 
 ## 定时任务
 

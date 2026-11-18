@@ -21,6 +21,7 @@ import type { ImageMediaType, ImageAttachmentRef } from '@deepseek-ai/dsh-attach
 import type { ModelSelection, ToolDefinition, RouterExecution } from '../types.js';
 import { RouterCompaction } from './router-compaction.js';
 import { retryModelStream } from './model-retry.js';
+import { resolveRouterCompactionSettings, type RouterCompactionSettings } from './router-compaction-policy.js';
 import { claimLogicalSession, DEFAULT_SESSION_MAX_BYTES, hasUnsettledWork, nextGeneration, readGeneration, surfaceSeed, writeGeneration, type SessionRotation, type SessionGeneration } from './session-generation.js';
 
 export interface NativeRuntimeOptions {
@@ -33,6 +34,7 @@ export interface NativeRuntimeOptions {
   /** Router hosts summarize routing background; Workers retain the native policy. */
   compactionRole?: 'router';
   compactionModel?:ModelSelection;
+  routerCompaction?:RouterCompactionSettings;
 }
 export interface NativeAgentOptions {
   id: string;
@@ -173,15 +175,26 @@ export class NativeAgentRuntime {
         const target=this.options.compactionModel,info=await ctx.llm.resolveModelInfo(target.provider,target.model);
         const window=info.context?.contextWindow;
         if(window){
-          const output=target.maxTokens??info.defaultMaxTokens??4096;
-          const headroom=Math.min(16_384,Math.floor(window/8));
-          if(output+headroom>=window)throw new Error('Router model leaves no context capacity after output and compaction reserves');
-          policy={...policy,thresholdRatio:Math.min(.65,48_000/window),headroomTokens:headroom,retainTokens:Math.min(8000,Math.floor((window-output-headroom)/8)),maxTokens:Math.min(16_384,info.defaultMaxTokens??16_384,Math.floor(window/4))};
+          const budget=resolveRouterCompactionSettings(this.options.routerCompaction);
+          const capacity=Math.min(window,budget.contextTokens??window);
+          const output=target.maxTokens??info.defaultMaxTokens??0;
+          const available=capacity-output-budget.headroomTokens;
+          if(available<=0)throw new Error('Router model leaves no context capacity; reduce routerCompaction.headroomTokens or the output reservation');
+          const threshold=Math.floor(Math.min(capacity*budget.thresholdRatio,budget.thresholdTokens??Infinity,available));
+          const retained=Math.floor((capacity-output)*budget.retainRatio);
+          if(retained>=threshold)throw new Error('Router retention reaches the pressure threshold; reduce routerCompaction.retainRatio or increase capacity');
+          // Use dsh's full-window defaults unless an operator supplies a smaller
+          // working set. Both pressure and retention then scale to that capacity.
+          const {retainTokens:_,retainRatio:__,...rest}=policy;
+          const capped=budget.contextTokens!==undefined||budget.thresholdTokens!==undefined;
+          policy={...rest,thresholdRatio:capped?threshold/window:budget.thresholdRatio,headroomTokens:budget.headroomTokens,
+            ...(capped?{retainTokens:retained}:{retainRatio:budget.retainRatio}),
+            maxTokens:Math.min(policy.maxTokens??budget.maxTokens,info.defaultMaxTokens??16_384,Math.floor(window/4))};
         }
       }
       await ctx.plugin(ToolResultPruner);
-      // Mount on the host before any Agent's final size guard. Use a smaller
-      // summary reserve than dsh's 64k CLI default for our bounded task answers.
+      // Mount before the final size guard. Router capacity follows dsh defaults;
+      // the auxiliary summary output budget stays independently bounded.
       await ctx.plugin(this.options.compactionRole==='router'?RouterCompaction:BasicCompaction, {
         thresholdRatio: 0.65, headroomTokens: 8192, maxTokens: 8192,
         ...(policy.retainTokens === undefined ? { retainRatio: 0.12 } : {}),

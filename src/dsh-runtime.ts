@@ -9,6 +9,7 @@ import { mountAgentPlugins } from './runtime/plugins.js';
 import { NativeAgentRuntime, type NativeAgent, type NativeImage, type NativeResult, type NativeMeasurement, type NativeModelCall } from './runtime/native.js';
 import { NativeRuntimePool, roleProviderProfile, type NativeLease } from './runtime/pool.js';
 import { modelRetriesExhausted, modelRetryTimeout } from './runtime/model-retry.js';
+import { resolveRouterCompactionSettings } from './runtime/router-compaction-policy.js';
 import { untilRouterAbort } from './runtime/router-budget.js';
 import { currentTaskQuestion } from './runtime/task-scope.js';
 import { ROUTER_SCHEDULE_INSTRUCTION, WORKER_SCHEDULE_INSTRUCTION } from './scheduled-tasks/tools.js';
@@ -341,6 +342,7 @@ export class DshRuntime implements RuntimePort {
       const extensions=await loadExtensions(config);
       lease=await this.acquire('router',config);abort.signal.throwIfAborted();
       const {context}=await this.routerLimits(config,lease,execution?.signal??abort.signal);
+      const workingContext=Math.min(resolveRouterCompactionSettings(config.routerCompaction).contextTokens??context,context);
       const inputBudget=await this.contextBudget(config,request.roomId,memory,execution?.signal??abort.signal);
       const payload=request.routing?JSON.stringify({...request,routing:{...request.routing,repair:undefined},result:request.result?{...request.result,report:{...request.result.report,details:undefined,attachments:undefined,fileAttachments:undefined,requirementState:undefined,requirementSnapshot:undefined,hostMemberMemory:undefined}}:undefined}):routerPayload(request,config,Boolean(readContext),inputBudget);
       if(Buffer.byteLength(payload)>inputBudget)throw Object.assign(new Error('Prepared Router input exceeds capacity'),{code:'ROUTER_PAYLOAD_OVERSIZED'});
@@ -365,7 +367,7 @@ export class DshRuntime implements RuntimePort {
             systemPrompt:routerSystemPrompt(config,Boolean(recall),request.roomId)+routingExtensionPrompt(extensions)+(memory?.fieldInstructions(request.roomId)??'')+(taskTools.length?'\n'+ROUTER_SCHEDULE_INSTRUCTION:''),
             tools:[...(recall?[recall.tool]:[]),...(memoryTool?[memoryTool]:[]),...taskTools],maxSteps:recall||memoryTool||taskTools.length?6:2,timeoutMs:config.routerTurnTimeoutMs??120_000,signal,execution:turnExecution,
             rotation:request.routing?{maxBytes:config.routerSessionMaxBytes}:undefined,
-            maxContextTokens:Math.min(64_000,context),maxContextBytes:Math.min(256_000,context*4),
+            maxContextTokens:workingContext,maxContextBytes:workingContext*4,
           });
           // Validation failures leave native state usable. Keep the read-only tool
           // records and read coverage for bounded corrections before reconstructing
