@@ -26,6 +26,7 @@ export interface MemoryWorkerEvent {
   coveredSeq?:number;version?:number;code?:string;attempt?:number;retryAt?:number;
 }
 export interface RoomMemoryWorkerOptions {
+  access?:(room:string)=>AbortSignal|false|undefined;
   store:RoomMemoryStore;
   concurrency:number;
   budget:(request:MemoryBudgetRequest,signal:AbortSignal)=>MemoryBudget|Promise<MemoryBudget>;
@@ -100,7 +101,7 @@ export class RoomMemoryWorker {
   }
 
   notify(roomId:string,targetSeq?:number):void {
-    if(this.closed)return;
+    if(this.closed||this.options.access?.(roomId)===false)return;
     const latest=this.options.store.latestSeq(roomId);targetSeq??=latest;
     if(!Number.isSafeInteger(targetSeq)||targetSeq<0)throw new Error('Invalid room memory target');
     targetSeq=Math.min(targetSeq,latest);
@@ -111,7 +112,7 @@ export class RoomMemoryWorker {
   }
 
   private enqueue(roomId:string,state:RoomState):void {
-    if(this.closed||state.running||state.queued||state.timer)return;
+    if(this.closed||state.running||state.queued||state.timer||this.options.access?.(roomId)===false)return;
     if(state.modelFailedThrough!==undefined&&state.targetSeq<=state.modelFailedThrough)return;
     if(state.targetSeq<=(this.options.store.head(roomId).version?.coveredSeq??0)){this.settleIdle();return;}
     state.queued=true;this.queue.push(roomId);
@@ -123,10 +124,11 @@ export class RoomMemoryWorker {
     while(this.active.size<this.options.concurrency&&this.queue.length){
       const roomId=this.queue.shift()!,state=this.rooms.get(roomId)!;state.queued=false;
       if(state.running||state.timer)continue;
+      const access=this.options.access?.(roomId);if(access===false)continue;
       if(state.targetSeq<=(this.options.store.head(roomId).version?.coveredSeq??0))continue;
       // A running batch owns a fixed target. New arrivals only raise state.targetSeq.
       const targetSeq=state.targetSeq,abort=new AbortController();state.running=true;
-      const promise=this.runBatch(roomId,targetSeq,state,abort.signal).catch(error=>{
+      const promise=this.runBatch(roomId,targetSeq,state,access?AbortSignal.any([abort.signal,access]):abort.signal).catch(error=>{
         if(!this.closed&&!abort.signal.aborted)this.retry(roomId,state,error);
       }).finally(()=>{
         state.running=false;this.active.delete(roomId);
@@ -179,7 +181,8 @@ export class RoomMemoryWorker {
     if(!batch.events.length){
       // Deleted/invalidated source rows still occupy sequence numbers. Advance
       // their verified empty prefix without inventing a model interpretation.
-      const committed=this.options.store.commit({roomId,epoch:batch.epoch,baseVersion:batch.baseVersion,untilSeq:batch.untilSeq,sourceDigest:batch.sourceDigest,notes:allNotes});
+      signal.throwIfAborted();
+    const committed=this.options.store.commit({roomId,epoch:batch.epoch,baseVersion:batch.baseVersion,untilSeq:batch.untilSeq,sourceDigest:batch.sourceDigest,notes:allNotes});
       if(committed){state.attempt=0;state.lastError=undefined;this.emit({kind:'committed',roomId,targetSeq:batch.untilSeq,coveredSeq:committed.coveredSeq,version:committed.version});}
       return;
     }
@@ -276,6 +279,7 @@ export class RoomMemoryWorker {
       const {supersedes:_,...fields}=note;
       return {...fields,...(supersedes.length?{supersedes}:{})};
     });
+    signal.throwIfAborted();
     const committed=this.options.store.commit({roomId,epoch:batch.epoch,baseVersion:batch.baseVersion,untilSeq:batch.untilSeq,sourceDigest:batch.sourceDigest,notes:[...inactiveNotes,...notes]});
     if(!committed){this.emit({kind:'superseded',roomId,targetSeq:batch.untilSeq});return;}
     state.attempt=0;state.retryAt=undefined;state.lastError=undefined;state.reason='initial';state.eventBudgetBytes=undefined;state.fragmentSeq=undefined;state.repairHint=undefined;

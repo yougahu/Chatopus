@@ -1349,7 +1349,9 @@ describe('host-enforced quoted thread and context handoff',()=>{
     const quote=message('follow','继续帮我解释',{replyToMessageId:row.platformMessageId});
     runtime.decide=request=>request.result?[{action:'publish_result',resultId:request.result.id}]:[{action:'open_thread',sourceMessageIds:[request.messages[0].id],subject:'新任务'}];
     await coordinator.receive(quote);
-    expect(store.inputs(thread.id).at(-1)?.contextReplies?.[0].text).toContain('当前状态');
+    expect(store.inputs(thread.id).at(-1)?.contextReplies?.[0].text).toBe(row.message.text);
+    expect(row.message.text).toContain('这个问题已经处理完了');
+    expect(row.message.text).not.toContain(thread.id);
     expect(store.threads()).toHaveLength(2);runtime.complete(0);await coordinator.drain(1000);
   });
   it('revives a cancelled quoted task only for its owner or an administrator',async()=>{

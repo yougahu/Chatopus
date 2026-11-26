@@ -19,8 +19,8 @@
     "maxTokens": 16000
   },
   "botCallNames": [
-    "\u52a9\u624b",
-    "\u673a\u5668\u4eba"
+    "助手",
+    "机器人"
   ],
   "plugins": [],
   "scheduledTasks": {
@@ -65,14 +65,20 @@
   "qq": {
     "enabled": false,
     "allowedGroupIds": [],
-    "port": 8083
+    "port": 8083,
+    "privateChat": {
+      "enabled": false,
+      "allowedUserIds": [],
+      "maxMessagesPerMinute": 30,
+      "replyMode": "plain"
+    }
   },
   "business": {
     "defaultProfile": "default",
     "roomProfiles": {},
     "profiles": {
       "default": {
-        "name": "\u901a\u7528\u52a9\u624b",
+        "name": "通用助手",
         "commonInstructions": "",
         "routerInstructions": "",
         "workerInstructions": "",
@@ -85,5 +91,10 @@
   "skills": [],
   "extensions": [],
   "routerTurnTimeoutMs": 120000,
-  "routerQueueTimeoutMs": 180000
+  "routerQueueTimeoutMs": 180000,
+  "attachments": {
+    "retentionDays": 7,
+    "maxStorageBytes": 10737418240,
+    "minFreeDiskBytes": 536870912
+  }
 }

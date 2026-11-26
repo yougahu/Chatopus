@@ -1,6 +1,6 @@
 const $ = id => document.getElementById(id);
-const titles = { overview: '运行概览', threads: '任务话题', messages: '群消息', decisions: '路由决策', outbox: '回复投递', sessions: '模型与工具轨迹', memory: '记忆', business: '业务 · 提示词', config: '模型 · 插件' };
-const subtitles = { overview: '关注正在发生的事，随时追溯每一次回答。', threads: '每个任务请求，都有独立、可追溯的处理链路。', messages: '查看群聊输入，以及消息进入系统后的处理状态。', decisions: '了解 Router 如何判断、关联和分配每一次对话。', outbox: '从回答生成到发送确认，查看每条回复的送达状态。', sessions: '以可读时间线，回看模型调用与工具使用过程。', memory: '按群查看成员画像、记忆内容、来源消息与写入状态。', business: '管理业务范围、角色指引和不同群的配置。', config: '为日常接话和任务处理，选择各自合适的模型。' };
+const titles = { overview: '运行概览', threads: '任务话题', messages: '群消息', decisions: '路由决策', outbox: '回复投递', sessions: '模型与工具轨迹', memory: '记忆', private: '私聊', business: '业务 · 提示词', config: '模型 · 插件' };
+const subtitles = { overview: '关注正在发生的事，随时追溯每一次回答。', threads: '每个任务请求，都有独立、可追溯的处理链路。', messages: '查看群聊输入，以及消息进入系统后的处理状态。', decisions: '了解 Router 如何判断、关联和分配每一次对话。', outbox: '从回答生成到发送确认，查看每条回复的送达状态。', sessions: '以可读时间线，回看模型调用与工具使用过程。', memory: '按群查看成员画像、记忆内容、来源消息与写入状态。', private: '管理好友私聊开关、访问名单与回复方式。', business: '管理业务范围、角色指引和不同群的配置。', config: '为日常接话和任务处理，选择各自合适的模型。' };
 const names = { running: '处理中', queued: '等待执行', needs_input: '等待补充', idle: '已完成', cancelled: '已取消', failed: '失败', unknown: '发送结果待确认', pending: '待发送', sent: '已发送', sending: '发送中', routed: '已路由', received: '已接收', ignored: '已忽略', processing: '处理中', new: '新消息', done: '已完成', succeeded: '已完成', success: '成功', aborted: '已中止', stale: '已被更新', superseded: '已被更新', reply: '直接回复', silence: '保持安静', spawn: '启动任务', start: '启动任务', append: '补充到话题', cancel: '取消任务', resume: '继续话题', react: '简短回应', publish: '发布答案' };
 Object.assign(names, { reply_direct: '直接回复', clarify: '追问澄清', open_thread: '启动任务', append_thread: '补充到话题', request_handoff: '查看交接', request_status: '查询进度', request_cancel: '取消任务', publish_result: '发布回答', defer_result: '延后回复', ready: '答案已就绪' });
 const statusOptions = { threads: ['running', 'queued', 'needs_input', 'idle', 'cancelled', 'failed'], messages: ['received', 'routed', 'ignored', 'failed'], outbox: ['pending', 'sending', 'sent', 'failed', 'unknown'] };
@@ -8,6 +8,7 @@ let view = 'overview', source = new URLSearchParams(location.search).get('source
 const memoryState = { room: '', member: '', profileOpen: false, memberQuery: '', memberItems: [], memberNextOffset: null, memberLoading: false, memberError: '', memberSequence: 0, query: '', results: [], searchDone: false, profileSequence: 0, searchSequence: 0 };
 const MEMORY_MEMBER_PAGE_SIZE = 50;
 let memberSearchTimer;
+let viewRequest, privateStatusTimer, privateStatusRequest;
 const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const short = (x, length = 150) => String(x ?? '').length > length ? String(x).slice(0, length) + '…' : String(x ?? '');
 const number = x => Number(x || 0).toLocaleString('zh-CN');
@@ -107,21 +108,21 @@ async function loadReplyImage(button) {
 }
 function notice(message = '', success = false) { $('notice').textContent = message; $('notice').classList.toggle('success', success); }
 async function api(path, options = {}) {
-  const query = new URLSearchParams(path === 'memory' || path.startsWith('memory/') ? { source, ...options.query } : { source, offset: String(offset), room: $('room').value, status: $('status').value, ...options.query });
-  const response = await fetch('/api/' + path + (options.method ? '' : '?' + query), { method: options.method || 'GET', ...(options.body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(options.body) } : {}) });
+  const query = new URLSearchParams(path === 'memory' || path.startsWith('memory/') ? { source, ...options.query } : { source, offset: String(offset), room: $('room').value, kind: $('conversation-kind')?.value || '', status: $('status').value, ...options.query });
+  const response = await fetch('/api/' + path + (options.method ? '' : '?' + query), { method: options.method || 'GET', ...(options.signal ? { signal: options.signal } : {}), ...(options.body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(options.body) } : {}) });
   const text = await response.text(); let data; try { data = JSON.parse(text); } catch { throw new Error('请求未完成（HTTP ' + response.status + '），请检查本地服务。'); }
   if (!response.ok) throw new Error(data.error || '读取失败，请稍后重试。');
   return data;
 }
 function configureView() {
   $('title').textContent = titles[view]; $('breadcrumb-view').textContent = titles[view]; $('subtitle').textContent = subtitles[view];
-  $('source').hidden = view === 'business';
+  $('source').hidden = view === 'business' || view === 'private';
   document.querySelector('main').classList.toggle('schedules-view', view === 'schedules');
   $('filters').hidden = view === 'schedules' || !statusOptions[view]; $('pager').hidden = !['threads', 'messages', 'decisions', 'outbox', 'schedules'].includes(view);
   $('refresh-note').hidden = view !== 'overview'; $('page').textContent = '第 ' + (offset / 100 + 1) + ' 页'; $('prev').disabled = !offset;
   if ($('status').dataset.view !== view) { $('status').dataset.view = view; $('status').innerHTML = '<option value="">全部状态</option>' + (statusOptions[view] || []).map(s => `<option value="${s}">${esc(label(s))}</option>`).join(''); }
   // The API currently supports group filtering for threads and messages.
-  $('room').closest('.filter-input').hidden = !['threads', 'messages', 'schedules'].includes(view);
+  $('room').closest('.filter-input').hidden = !['threads', 'messages', 'outbox', 'schedules'].includes(view);
   document.querySelectorAll('nav button').forEach(b => { b.classList.toggle('active', b.dataset.view === view); if (b.dataset.view === view) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
   keepNavigationVisible();
 }
@@ -196,7 +197,7 @@ function businessCapabilities(kind, selected, items = []) {
   }).join('') : '<p class="business-empty">还没有注册可选项。先在部署配置中注册，刷新后即可选择。</p>'}</div>`;
 }
 function businessRoomRow(room = '', id = businessState.selected, index = 0) {
-  return `<div class="business-room-row"><div class="form-field"><label for="business-room-${index}">完整群作用域</label><input id="business-room-${index}" data-business-room value="${esc(room)}" placeholder="qq:机器人账号:群号" maxlength="256" autocomplete="off"></div><div class="form-field"><label for="business-room-profile-${index}">使用的业务</label><select id="business-room-profile-${index}" data-business-room-profile>${businessChoices(id)}</select></div><button class="button small" type="button" data-business-room-remove aria-label="移除此群绑定">移除</button></div>`;
+  return `<div class="business-room-row"><div class="form-field"><label for="business-room-${index}">完整群作用域</label><input id="business-room-${index}" data-business-room value="${esc(room)}" placeholder="qq:机器人账号:群号" maxlength="256" autocomplete="off"></div><div class="form-field"><label for="business-room-profile-${index}">使用的业务</label><select id="business-room-profile-${index}" data-business-room-profile>${businessChoices(id)}</select></div><button class="button small" type="button" data-business-room-remove aria-label="移除此会话绑定">移除</button></div>`;
 }
 function businessPersona(profile) {
   const text = profile.personaText || '';
@@ -252,16 +253,16 @@ function businessPage() {
           ${businessPersona(profile)}
         </div>
         <div class="business-pane" ${pane('scope')}>
-          <div class="business-section-intro"><h3>决定各个群使用哪个业务</h3><p>这一页设置影响全部业务。未单独指定的群使用默认业务；群绑定优先于默认值。</p></div>
+          <div class="business-section-intro"><h3>决定各个群使用哪个业务</h3><p>这一页设置影响全部业务。未单独指定的群使用默认业务；会话绑定优先于默认值。</p></div>
           <section class="business-section"><div class="form-field business-default-field"><label for="business-default">默认业务</label><select id="business-default">${businessChoices(settings.defaultProfile)}</select><span class="field-help">适用于所有未在下方单独绑定的群。切换上方“正在编辑的业务”不会改变默认业务。</span></div></section>
-          <section class="business-section"><div class="business-section-heading"><div><h3>群专属业务</h3><p>群作用域由平台、机器人账号、群号共同组成。例如 qq:123456:987654。</p></div><button class="button small" type="button" data-business-room-add>＋ 添加群绑定</button></div><div id="business-room-rows">${rooms}</div><p class="business-empty" id="business-rooms-empty"${rooms ? ' hidden' : ''}>还没有单独绑定的群，所有群使用默认业务。</p></section>
+          <section class="business-section"><div class="business-section-heading"><div><h3>群专属业务</h3><p>群作用域由平台、机器人账号、群号共同组成。例如 qq:123456:987654。</p></div><button class="button small" type="button" data-business-room-add>＋ 添加会话绑定</button></div><div id="business-room-rows">${rooms}</div><p class="business-empty" id="business-rooms-empty"${rooms ? ' hidden' : ''}>还没有单独绑定的群，所有群使用默认业务。</p></section>
           <p class="business-callout">保存后，新调用使用新配置；已在处理中的任务继续使用启动时的配置。</p>
         </div>
       </section>
       <textarea id="business-skills" hidden>${esc(profile.skillIds.join('\n'))}</textarea><textarea id="business-extensions" hidden>${esc(profile.extensionIds.join('\n'))}</textarea><textarea id="business-memory" hidden>${esc((profile.memoryFields || []).join('\n'))}</textarea><textarea id="business-rooms" hidden>${esc(businessState.roomDraft)}</textarea>
       <div class="business-savebar"><div class="business-save-info"><strong data-business-save-label>${businessState.dirty ? '有未保存的更改' : '配置已保存'}</strong><span class="form-message" role="status" aria-live="polite">${businessState.dirty ? '保存全部配置后生效；切换页面会保留当前草稿。' : '新调用生效，在途任务保持原配置。'}</span></div><div class="business-save-actions"><button class="button subtle" type="button" data-business-discard${businessState.dirty ? '' : ' hidden'}>放弃草稿</button><button class="button" type="button" data-business-history>版本记录</button><button class="button" type="button" data-business-preview>预览提示词</button><button class="button primary" type="submit">保存全部配置</button></div></div>
     </form>
-    <dialog id="business-create-dialog" class="business-create-dialog" aria-labelledby="business-create-title"><form data-business-create novalidate><div class="business-create-head"><div class="section-kicker">NEW PROFILE</div><h2 id="business-create-title">新增业务配置</h2><p>为另一种业务单独配置提示词、技能与工具。</p></div><div class="business-create-fields"><div class="form-field"><label for="business-new-name">业务名称</label><input id="business-new-name" maxlength="120" placeholder="例如：文档助手" autocomplete="off"></div><div class="form-field"><label for="business-new-id">配置 ID</label><input id="business-new-id" maxlength="128" autocomplete="off" aria-describedby="business-new-id-help"><span class="field-help" id="business-new-id-help">用于内部关联，创建后保持不变。可使用字母、数字、点、横线、下划线或冒号。</span></div><div class="form-field"><label for="business-copy-source">初始内容</label><select id="business-copy-source"><option value="">从空白配置开始</option>${businessChoices('')}</select><span class="field-help">复制已有业务会带入其提示词与能力，之后可以独立编辑；不会复制群绑定。</span></div><p class="form-message" role="alert"></p></div><div class="business-create-actions"><button class="button" type="button" data-business-create-cancel>取消</button><button class="button primary" type="submit">创建草稿</button></div></form></dialog>
+    <dialog id="business-create-dialog" class="business-create-dialog" aria-labelledby="business-create-title"><form data-business-create novalidate><div class="business-create-head"><div class="section-kicker">NEW PROFILE</div><h2 id="business-create-title">新增业务配置</h2><p>为另一种业务单独配置提示词、技能与工具。</p></div><div class="business-create-fields"><div class="form-field"><label for="business-new-name">业务名称</label><input id="business-new-name" maxlength="120" placeholder="例如：文档助手" autocomplete="off"></div><div class="form-field"><label for="business-new-id">配置 ID</label><input id="business-new-id" maxlength="128" autocomplete="off" aria-describedby="business-new-id-help"><span class="field-help" id="business-new-id-help">用于内部关联，创建后保持不变。可使用字母、数字、点、横线、下划线或冒号。</span></div><div class="form-field"><label for="business-copy-source">初始内容</label><select id="business-copy-source"><option value="">从空白配置开始</option>${businessChoices('')}</select><span class="field-help">复制已有业务会带入其提示词与能力，之后可以独立编辑；不会复制会话绑定。</span></div><p class="form-message" role="alert"></p></div><div class="business-create-actions"><button class="button" type="button" data-business-create-cancel>取消</button><button class="button primary" type="submit">创建草稿</button></div></form></dialog>
   </div>`;
 }
 function setBusinessTab(id, focus = false) {
@@ -298,9 +299,9 @@ function collectBusinessDraft(validate = false) {
   for (const [index, raw] of businessState.roomDraft.split('\n').entries()) {
     if (!raw.trim()) continue;
     const match = /^\s*(\S+)\s*=\s*(\S+)\s*$/.exec(raw);
-    if (!match || ['__proto__', 'constructor', 'prototype'].includes(match[1])) { roomError = `第 ${index + 1} 条群绑定缺少有效的群作用域或业务配置。`; break; }
-    if (Object.hasOwn(roomProfiles, match[1])) { roomError = `第 ${index + 1} 条群绑定重复：同一群只能使用一个业务配置。`; break; }
-    if (!Object.hasOwn(businessState.settings.profiles, match[2])) { roomError = `第 ${index + 1} 条群绑定指向不存在的业务配置。`; break; }
+    if (!match || ['__proto__', 'constructor', 'prototype'].includes(match[1])) { roomError = `第 ${index + 1} 条会话绑定缺少有效的群作用域或业务配置。`; break; }
+    if (Object.hasOwn(roomProfiles, match[1])) { roomError = `第 ${index + 1} 条会话绑定重复：同一群只能使用一个业务配置。`; break; }
+    if (!Object.hasOwn(businessState.settings.profiles, match[2])) { roomError = `第 ${index + 1} 条会话绑定指向不存在的业务配置。`; break; }
     roomProfiles[match[1]] = match[2];
   }
   businessState.settings = { ...businessState.settings, defaultProfile: $('business-default').value,
@@ -353,7 +354,7 @@ function addBusinessRoom() {
 function requestBusinessDiscard() {
   $('detail-title').textContent = '放弃未保存的更改？';
   $('detail').querySelector('.section-kicker').textContent = '草稿管理';
-  $('detail-body').innerHTML = '<p>将重新读取已保存的全部业务配置。当前新增的配置、提示词修改和群绑定草稿都会被放弃。</p><div class="form-actions"><span class="form-message" role="status"></span><button class="button" data-business-discard-confirm>放弃草稿并重新读取</button></div>'; $('detail').showModal();
+  $('detail-body').innerHTML = '<p>将重新读取已保存的全部业务配置。当前新增的配置、提示词修改和会话绑定草稿都会被放弃。</p><div class="form-actions"><span class="form-message" role="status"></span><button class="button" data-business-discard-confirm>放弃草稿并重新读取</button></div>'; $('detail').showModal();
 }
 async function discardBusinessDraft(button) {
   const state = businessState, sequence = ++businessSequence; renderSequence++; button.disabled = true;
@@ -392,7 +393,7 @@ async function showBusinessHistory() {
     if (sequence !== businessSequence || view !== 'business') return;
     $('detail-title').textContent = '业务配置版本';
     $('detail').querySelector('.section-kicker').textContent = '版本记录';
-    $('detail-body').innerHTML = '<p class="panel-description">回退将替换全部业务配置及群绑定。其他设置不受影响；尚未保存的编辑不会保留。</p>' + (history.length ? history.map(item => '<article class="alert-item"><strong>' + esc(item.profiles.join('、')) + '</strong><p class="table-sub">' + time(item.savedAt) + ' · ' + esc(item.revision.slice(0, 12)) + '</p><button class="button small" data-business-rollback="' + esc(item.revision) + '"' + (item.revision === businessState.revision ? ' disabled' : '') + '>' + (item.revision === businessState.revision ? '当前版本' : '回退到此版本') + '</button></article>').join('') : empty('尚无历史版本', '首次保存后可查看历史和回退。'));
+    $('detail-body').innerHTML = '<p class="panel-description">回退将替换全部业务配置及会话绑定。其他设置不受影响；尚未保存的编辑不会保留。</p>' + (history.length ? history.map(item => '<article class="alert-item"><strong>' + esc(item.profiles.join('、')) + '</strong><p class="table-sub">' + time(item.savedAt) + ' · ' + esc(item.revision.slice(0, 12)) + '</p><button class="button small" data-business-rollback="' + esc(item.revision) + '"' + (item.revision === businessState.revision ? ' disabled' : '') + '>' + (item.revision === businessState.revision ? '当前版本' : '回退到此版本') + '</button></article>').join('') : empty('尚无历史版本', '首次保存后可查看历史和回退。'));
     $('detail').showModal();
   } catch(error) { businessError(error); }
 }
@@ -407,6 +408,91 @@ async function rollbackBusiness(button) {
   finally { state.saving = false; }
 }
 
+function privateChatApplied(value) { return value.running && !value.error && value.applied?.digest === value.digest; }
+function privateChatFeedback(value) {
+  const current = privateChatApplied(value), applied = value.applied;
+  const text = value.error ? '配置已保存，但运行服务应用失败。错误：' + (value.error.code || value.error)
+    : !value.running ? '配置已保存，服务离线；启动后自动应用。'
+    : current ? '已保存的配置已生效。' : '配置已保存，正在等待运行服务应用…';
+  return `<p class="notice${current && !value.restartRequired ? ' success' : ''}" role="status">${esc(text)}${applied ? ' 最近应用：' + time(applied.appliedAt) : ''}${value.restartRequired ? ' QQ 身份、连接或文件桥接设置已变化，需要重启服务。' : ''}</p>${value.attachmentStorage ? '<p class="panel-description">受管附件：' + number(value.attachmentStorage.files) + ' 个，' + number(value.attachmentStorage.bytes) + ' 字节；有效引用释放后保留 ' + number(value.attachmentStorage.retentionDays || 7) + ' 天。文件到期后需要重传。</p>' : ''}`;
+}
+function stopPrivateStatusRefresh() {
+  clearTimeout(privateStatusTimer); privateStatusRequest?.abort(); privateStatusRequest = undefined;
+}
+function queuePrivateStatusRefresh(form, value) {
+  clearTimeout(privateStatusTimer);
+  if (view !== 'private' || !form?.isConnected || form.dataset.saving === 'true' || privateChatApplied(value)) return;
+  privateStatusTimer = setTimeout(() => refreshPrivateChatStatus(form), 1500);
+}
+async function refreshPrivateChatStatus(form) {
+  if (view !== 'private' || !form?.isConnected || form.dataset.saving === 'true') return;
+  const request = new AbortController(), revision = form.dataset.revision;
+  privateStatusRequest?.abort(); privateStatusRequest = request;
+  const current = () => view === 'private' && form.isConnected && form.dataset.revision === revision && !request.signal.aborted;
+  let value;
+  try {
+    value = (await api('config', { signal: request.signal })).privateChatStatus;
+    if (!current()) return;
+    if (value.digest !== form.dataset.digest) {
+      form.querySelector('.private-chat-feedback').innerHTML = '<p class="notice" role="status">配置已被其他操作修改，请刷新后再保存。</p>'; return;
+    }
+    // Refresh feedback only: preserve fields being edited and the version used for conflict detection.
+    form.querySelector('.private-chat-feedback').innerHTML = privateChatFeedback(value);
+  } catch (error) {
+    if (!current()) return;
+    form.querySelector('.private-chat-feedback').innerHTML = '<p class="notice" role="status">暂时无法查询生效状态，正在自动重试。' + esc(error.message) + '</p>';
+  } finally {
+    if (privateStatusRequest === request) privateStatusRequest = undefined;
+  }
+  if (current()) queuePrivateStatusRefresh(form, value || {});
+}
+function privateChatForm(value) {
+  if (!value?.settings) return panel('QQ 好友私聊', '<p class="notice">' + esc(value?.error || '无法读取私聊配置') + '</p>');
+  const s = value.settings;
+  return panel('QQ 好友私聊', `<form class="private-chat-form" data-private-chat-config data-revision="${esc(value.revision)}" data-digest="${esc(value.digest)}">
+    <p class="panel-description">只接收白名单内好友的一对一消息，拒绝临时会话。业务可在「业务 · 提示词」中绑定。</p>
+    <div class="private-chat-toggle-row">
+      <div><label id="private-chat-enabled-label" for="private-chat-enabled">启用私聊</label><p id="private-chat-enabled-help">保存后自动应用，无需重启服务。</p></div>
+      <label class="private-chat-switch"><input id="private-chat-enabled" name="enabled" type="checkbox" role="switch" aria-labelledby="private-chat-enabled-label" aria-describedby="private-chat-enabled-help"${s.enabled ? ' checked' : ''}><span aria-hidden="true"></span></label>
+    </div>
+    <div class="private-chat-fields">
+      <div class="form-field wide"><label for="private-chat-users">允许的好友 QQ 号</label><textarea id="private-chat-users" name="users" rows="4" placeholder="每行填写一个 QQ 号" aria-describedby="private-chat-users-help">${esc(s.allowedUserIds.join('\n'))}</textarea><p id="private-chat-users-help" class="field-help">每行一个，仅名单内好友可发起私聊。</p></div>
+      <div class="form-field"><label for="private-chat-limit">每分钟普通消息上限</label><input id="private-chat-limit" name="limit" type="number" min="1" max="600" value="${s.maxMessagesPerMinute}"></div>
+      <div class="form-field"><label for="private-chat-reply-mode">回复显示</label><select id="private-chat-reply-mode" name="replyMode"><option value="plain"${s.replyMode === 'plain' ? ' selected' : ''}>普通回复</option><option value="quote"${s.replyMode === 'quote' ? ' selected' : ''}>引用原消息</option></select></div>
+    </div>
+    <div class="private-chat-feedback">${privateChatFeedback(value)}</div>
+    <div class="form-actions"><span class="form-message" role="status"></span><button class="button primary" type="submit">保存私聊配置</button></div>
+  </form>`);
+}
+function deliveryResolutionPanel(row) {
+  const data = row.data || row, parts = row.deliveryParts || [];
+  if (!parts.length) return '';
+  const labels = { confirmed_received: '人工确认收到', abandoned: '已放弃', resent: '补发已完成' };
+  return '<h3>逐项投递与结案</h3><p class="panel-description">结案保留原始平台回执。后续计划需要单独恢复。</p>' + parts.map(part => `<section class="alert-item"><strong>${esc(part.name)}</strong> ${badge(part.status)}<p>${part.resolution ? esc(labels[part.resolution.reason] || part.resolution.reason) + ' · ' + esc(part.resolution.actor.kind === 'admin' ? '后台' : '本人') + ' · ' + time(part.resolution.resolvedAt) : '尚未人工结案'}</p>${source === 'main' && !data.resendOf && data.status !== 'sending' && !part.resolution && part.status !== 'sent' ? `<div class="form-actions">${part.status === 'unknown' ? `<button class="button small" data-delivery-decision="received" data-outbox="${esc(data.id)}" data-part="${esc(part.id)}" data-version="${data.resolutionVersion || 0}">确认收到</button>` : ''}<button class="button small" data-delivery-decision="abandon" data-outbox="${esc(data.id)}" data-part="${esc(part.id)}" data-version="${data.resolutionVersion || 0}">放弃本项</button></div>` : ''}</section>`).join('');
+}
+async function savePrivateChat(form) {
+  if (form.dataset.saving === 'true') return;
+  stopPrivateStatusRefresh(); form.dataset.saving = 'true';
+  const button = form.querySelector('button'), status = form.querySelector('.form-message'); button.disabled = true;
+  status.classList.remove('error'); status.textContent = '正在保存…';
+  let saved;
+  try {
+    const fields = new FormData(form), settings = {enabled: fields.get('enabled') === 'on',allowedUserIds: String(fields.get('users')).split(/\s+/).filter(Boolean),maxMessagesPerMinute:Number(fields.get('limit')),replyMode:fields.get('replyMode')};
+    saved = await api('config',{method:'POST',body:{settings,revision:form.dataset.revision}});
+    if (!form.isConnected) return;
+    form.dataset.revision = saved.revision; form.dataset.digest = saved.digest;
+    form.querySelector('.private-chat-feedback').innerHTML = privateChatFeedback(saved); status.textContent = '';
+  } catch (error) {status.textContent = '保存失败：' + error.message;status.classList.add('error');}
+  finally {form.dataset.saving = 'false';button.disabled = false;if (saved) queuePrivateStatusRefresh(form, saved);}
+}
+document.addEventListener('submit', event => {
+  const form = event.target.closest('[data-private-chat-config]'); if (!form) return; event.preventDefault(); void savePrivateChat(form);
+});
+document.addEventListener('click', async event => {
+  const button = event.target.closest('[data-delivery-decision]');if (!button) return;button.disabled = true;
+  try {await api('deliveries/resolve',{method:'POST',body:{outboxId:button.dataset.outbox,partIds:[button.dataset.part],decision:button.dataset.deliveryDecision,expectedResolutionVersion:Number(button.dataset.version),key:crypto.randomUUID()}});$('detail').close();await render();}
+  catch(error){notice(error.message);}finally{button.disabled=false;}
+});
 function configPage(data, memoryModel) {
   const plugins = data.plugins || [];
   return `${activationForm(data)}<div class="info-banner"><span>↻</span><div><strong>按用途独立配置模型</strong><span>Router、Worker 与记忆提炼可使用各自的模型和 API Key。Router 与 Worker 保存后下一次调用生效；记忆提炼保存后应用到记忆服务。</span></div></div><div class="config-grid">${modelForm(data, 'router')}${modelForm(data, 'worker')}${openVikingModelForm(memoryModel)}
@@ -580,14 +666,17 @@ async function showMemorySource(id) {
   await memoryDetail('记忆来源消息', 'source', { id }, data => '<div class="detail-summary"><span class="badge">' + (data.kind === 'reply' ? '已确认回复' : '群消息') + '</span><span>' + esc(data.authorName || data.authorId || '机器人') + '</span><span>' + time(data.timestamp) + '</span></div><p class="answer-body">' + esc(data.text || '附件消息') + '</p>' + (data.truncated ? '<p class="table-sub">来源消息较长，当前展示已截断。</p>' : '') + '<p class="mono">' + esc(data.id) + '</p>');
 }
 async function render({ silent = false } = {}) {
+  if (silent && viewRequest) return;
+  viewRequest?.abort(); viewRequest = undefined; stopPrivateStatusRefresh();
   if (view === 'schedules') { const sequence = ++renderSequence; configureView(); if (!silent) notice(); try { await renderSchedules(sequence); } catch (error) { if (sequence === renderSequence) notice(error.message); } return; }
   if (view === 'business' && businessState?.saving) return;
   if (view === 'business' && document.querySelector('[data-business-config]')) collectBusinessDraft();
   if (view === 'business' && businessState?.dirty) { renderSequence++; configureView(); if (!document.querySelector('[data-business-config]')) $('content').innerHTML = businessPage(); updateBusinessStatus('未保存的草稿已保留。保存后生效，或选择“放弃草稿”读取已保存版本。'); return; }
   const sequence = ++renderSequence, requestedView = view; configureView(); if (!silent) notice();
+  const request = new AbortController(); viewRequest = request;
   if (view === 'memory') $('content').innerHTML = panel('记忆', '<p class="muted">正在读取记忆状态…</p>');
   try {
-    const [data, recent, memoryModel] = await Promise.all([api(view === 'business' ? 'business-config' : view), view === 'overview' ? api('threads', { query: { offset: '0', room: '', status: '' } }) : Promise.resolve([]), view === 'config' ? api('openviking-model-config').catch(error => ({ available: false, reason: error.message })) : Promise.resolve(undefined)]);
+    const [data, recent, memoryModel] = await Promise.all([api(view === 'business' ? 'business-config' : view === 'private' ? 'config' : view, { signal: request.signal }), view === 'overview' ? api('threads', { signal: request.signal, query: { offset: '0', room: '', status: '', limit: '6' } }) : Promise.resolve([]), view === 'config' ? api('openviking-model-config', { signal: request.signal }).catch(error => ({ available: false, reason: error.message })) : Promise.resolve(undefined)]);
     if (sequence !== renderSequence || requestedView !== view) return;
     if (view === 'business' && document.querySelector('[data-business-config]')) {
       if (businessState?.saving) return;
@@ -596,17 +685,20 @@ async function render({ silent = false } = {}) {
     }
     rows = Array.isArray(data) ? data : []; let html = '';
     if (view === 'overview') html = overview(data, recent);
-    else if (view === 'threads') html = table(['话题 / 群', '状态', '输入进度', 'Token 用量', '最近更新', ''], data, (r, i) => [`<div class="table-primary">${esc(r.data?.subject || '未命名话题')}</div><div class="table-sub mono">${esc(r.room)}</div>`, badge(r.status), `${number(r.data?.latestInputSeq)} 条输入<div class="table-sub">第 ${number(r.data?.revision)} 版</div>`, taskTokenCell(r.tokenUsage), `<span class="nowrap">${time(r.updated)}</span>`, detailButton(i, '追踪')]) + '<p class="panel-description">Token 用量累计本任务已记录的 Worker 输入与输出，输入包含缓存。</p>';
+    else if (view === 'threads') html = table(['话题 / 会话', '状态', '输入进度', 'Token 用量', '最近更新', ''], data, (r, i) => [`<div class="table-primary">${esc(r.data?.subject || '未命名话题')}</div><div class="table-sub mono">${esc(r.room)}</div>`, badge(r.status), `${number(r.data?.latestInputSeq)} 条输入<div class="table-sub">第 ${number(r.data?.revision)} 版</div>`, taskTokenCell(r.tokenUsage), `<span class="nowrap">${time(r.updated)}</span>`, detailButton(i, '追踪')]) + '<p class="panel-description">Token 用量累计本任务已记录的 Worker 输入与输出，输入包含缓存。</p>';
     else if (view === 'messages') html = table(['发送者 / 群', '消息内容', '处理状态', '接收时间', ''], data, (r, i) => [`<div class="table-primary">${esc(r.data?.authorName || r.data?.authorId || '未知发送者')}</div><div class="table-sub mono">${esc(r.room)}</div>`, esc(short(r.data?.text)) + (r.data?.attachments?.length ? `<div class="table-sub">▧ ${r.data.attachments.length} 个附件</div>` : ''), badge(r.status), `<span class="nowrap">${time(r.at)}</span>`, detailButton(i)]);
     else if (view === 'decisions') html = table(['触发事件', '路由动作', '关联消息', '决策时间', ''], data, (r, i) => [esc(eventName(r.event)), (Array.isArray(r.data) ? r.data : []).map(x => badge(x.action)).join(' '), `<span class="mono">${esc(short(r.message_id || 'Worker 执行结果', 36))}</span>`, `<span class="nowrap">${time(r.at)}</span>`, detailButton(i)]);
     else if (view === 'outbox') html = table(['回复目标', '回复内容', '投递状态', '发送尝试', ''], data, (r, i) => [`<div class="mono">${esc(r.room || r.data?.message?.roomId)}</div>`, (r.data?.kind === 'acknowledgement' ? '<div class="table-sub">接收确认</div>' : '') + esc(short(replyText(r.data?.message))) + replyAttachmentSummary(r), badge(r.status), number(r.data?.attempts), detailButton(i)]);
     else if (view === 'sessions') html = table(['模型会话', '记录大小', '最后更新', ''], data, (r, i) => [`<div class="table-primary mono">${esc(r.id)}</div><div class="table-sub">输入 → 推理 → 工具 → 结果</div>`, (r.bytes / 1024).toFixed(1) + ' KB', `<span class="nowrap">${time(r.updated)}</span>`, detailButton(i, '工具轨迹')]);
     else if (view === 'memory') html = await memoryPage(data);
     else if (view === 'business') { businessState = { ...data, tab: businessState?.tab, selected: businessState?.selected && data.settings.profiles[businessState.selected] ? businessState.selected : data.settings.defaultProfile }; html = businessPage(); }
+    else if (view === 'private') html = privateChatForm(data.privateChatStatus);
     else if (view === 'config') html = configPage(data, memoryModel);
     if (sequence !== renderSequence || requestedView !== view) return;
     $('content').innerHTML = html; $('updated').textContent = '最近更新 ' + new Date().toLocaleTimeString('zh-CN'); $('next').disabled = rows.length < 100;
-  } catch (error) { if (sequence === renderSequence) notice(error.message); }
+    if (view === 'private') queuePrivateStatusRefresh(document.querySelector('[data-private-chat-config]'), data.privateChatStatus);
+  } catch (error) { if (sequence === renderSequence && !request.signal.aborted) notice(error.message); }
+  finally { if (viewRequest === request) viewRequest = undefined; }
 }
 function eventName(type) { return ({ 'input_committed':'保存任务输入', 'run_started':'绑定输入并启动', 'run_supersede_requested':'请求旧运行退出', 'run_superseded':'旧运行已退出', 'worker_cleanup_blocked':'等待旧运行退出', 'handoff_reply_queued':'即时回执已入队', 'delivery_attempt_started':'开始投递', 'delivery_attempt_settled':'投递回执', 'session': '建立模型会话', 'model/selection': '选择模型', 'turn/start': '开始处理', 'turn/end': '本轮处理结束', 'turn/abort': '本轮已中止', 'user/message': '收到任务输入', 'assistant/message': '模型回应', 'tool/result': '工具返回结果', 'tool/call': '调用工具', 'message': '群消息', 'messages': '收到群消息', 'timer': '定时检查', 'request/header': '准备模型请求', 'request/context': '整理模型上下文', 'compaction/start': '开始压缩上下文', 'compaction/summary': '生成历史摘要', 'compaction/end': '上下文压缩结束', 'compaction/prune': '裁剪过长工具结果', 'worker_result': '任务返回', 'worker-result': '任务返回', 'error': '调用异常' })[type] || label(type); }
 const toolNames = {};
@@ -713,7 +805,7 @@ async function showDetail(index) {
   $('detail-title').textContent = titles[view] + ' · 记录';
   let summary = '';
   if (view === 'messages') summary = `<div class="detail-summary">${badge(row.status)}<span>${esc(row.data?.authorName || row.data?.authorId)}</span><span class="mono">${esc(row.room)}</span></div><p class="answer-body">${esc(row.data?.text || '附件消息')}</p>`;
-  if (view === 'outbox') summary = `<div class="detail-summary">${badge(row.status)}${row.data?.kind === 'acknowledgement' ? '<span>接收确认</span>' : ''}<span class="mono">${esc(row.room || row.data?.message?.roomId)}</span></div><p class="answer-body">${esc(replyText(row.data?.message))}</p>${replyImages(row)}${replyFiles(row)}<p class="muted">已尝试 ${number(row.data?.attempts)} 次发送。</p>${row.data?.reason ? '<p class="notice">' + esc(deliveryReason(row.data.reason)) + '</p>' : ''}${lifecycleAudit(row.deliveryEvents || [])}`;
+  if (view === 'outbox') summary = `<div class="detail-summary">${badge(row.status)}${row.data?.kind === 'acknowledgement' ? '<span>接收确认</span>' : ''}<span class="mono">${esc(row.room || row.data?.message?.roomId)}</span></div><p class="answer-body">${esc(replyText(row.data?.message))}</p>${replyImages(row)}${replyFiles(row)}<p class="muted">已尝试 ${number(row.data?.attempts)} 次发送。</p>${row.data?.reason ? '<p class="notice">' + esc(deliveryReason(row.data.reason)) + '</p>' : ''}${lifecycleAudit(row.deliveryEvents || [])}${deliveryResolutionPanel(row)}`;
   if (view === 'decisions') summary = `<div class="detail-summary"><span>${esc(eventName(row.event))}</span><span>${time(row.at)}</span></div>${(Array.isArray(row.data) ? row.data : []).map(action => `<div class="alert-item">${badge(action.action)}<p class="answer-body">${esc(readableText(action, 1200))}</p></div>`).join('')}`;
   $('detail-body').innerHTML = summary + raw(row); $('detail').showModal();
 }
@@ -788,7 +880,7 @@ async function saveOpenVikingModel(form, applyOnly = false) {
     form.querySelector('[data-openviking-apply]').disabled = form.dataset.restartSupported !== 'true' || form.dataset.restarting === 'true';
   }
 }
-function navigate(next) { if (!titles[next] || scheduleState.saving) return; if (view === 'business' && businessState?.saving) { updateBusinessStatus('正在保存，请稍候…'); return; } if (view === 'business' && document.querySelector('[data-business-config]')) collectBusinessDraft(); businessSequence++; detailSequence++; clearImages(); $('detail').close(); $('detail').querySelector('.section-kicker').textContent = '完整处理链路'; view = next; offset = 0; render(); }
+function navigate(next) { if (!titles[next] || next === view || scheduleState.saving) return; if (view === 'business' && businessState?.saving) { updateBusinessStatus('正在保存，请稍候…'); return; } if (view === 'business' && document.querySelector('[data-business-config]')) collectBusinessDraft(); businessSequence++; detailSequence++; clearImages(); $('detail').close(); $('detail').querySelector('.section-kicker').textContent = '完整处理链路'; view = next; offset = 0; $('content').innerHTML = panel(titles[next], '<p class="panel-description" role="status">正在加载…</p>'); render(); }
 document.querySelector('nav').addEventListener('click', event => { const button = event.target.closest('[data-view]'); if (button) navigate(button.dataset.view); });
 $('content').addEventListener('click', event => { const button = event.target.closest('button'); if (!button) return; if (button.hasAttribute('data-business-add')) openBusinessCreate(); else if (button.hasAttribute('data-business-create-cancel')) $('business-create-dialog').close(); else if (button.dataset.businessTab) setBusinessTab(button.dataset.businessTab); else if (button.hasAttribute('data-business-discard')) requestBusinessDiscard(); else if (button.hasAttribute('data-business-room-add')) addBusinessRoom(); else if (button.hasAttribute('data-business-room-remove')) { button.closest('.business-room-row').remove(); syncBusinessRooms(); } else if (button.hasAttribute('data-business-preview')) previewBusiness(); else if (button.hasAttribute('data-business-history')) showBusinessHistory(); else if (button.hasAttribute('data-business-persona-clear')) clearBusinessPersona(); else if (button.hasAttribute('data-openviking-apply')) saveOpenVikingModel(button.closest('[data-openviking-model]'), true); else if (button.dataset.memoryMember) selectMemoryMember(button.dataset.memoryMember); else if (button.hasAttribute('data-memory-back')) showMemoryMembers(); else if (button.dataset.memoryHit !== undefined) showMemoryContent(Number(button.dataset.memoryHit)); else if (button.dataset.memoryUri) showMemoryUri(button.dataset.memoryUri); else if (button.dataset.memorySource) showMemorySource(button.dataset.memorySource); else if (button.hasAttribute('data-memory-retry')) loadMemoryMembers(!memoryState.memberItems.length); else if (button.dataset.detail !== undefined) showDetail(Number(button.dataset.detail)); else if (button.dataset.threadId) showThread(button.dataset.threadId); else if (button.dataset.go) navigate(button.dataset.go); });
 $('content').addEventListener('input', event => { if (event.target.closest('[data-business-config]')) { if (event.target.hasAttribute('data-business-room')) syncBusinessRooms(); else businessDirty(); if (event.target.id === 'business-persona') updateBusinessPersonaEditor(); const count = document.querySelector('[data-business-count="' + event.target.id + '"]'); if (count && event.target.id !== 'business-persona') count.textContent = event.target.value.length.toLocaleString() + ' / 16,000'; } if (event.target.id === 'memory-member-query' && !event.isComposing) searchMemoryMembers(event.target.value); });
@@ -861,7 +953,7 @@ function schedulePage(data, policy) {
     return '<tr>' + cells.map((cell, i) => `<td data-label="${['任务', '执行规则', '状态', '下次执行', '最近执行', ''][i]}">${cell}</td>`).join('') + '</tr>';
   }).join('');
   const list = items.length ? `<div class="schedule-table-wrap"><table class="schedule-table"><thead><tr>${['任务 / 归属', '执行规则', '状态', '下次执行', '最近执行', ''].map(title => `<th>${title}</th>`).join('')}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`
-    : `<div class="schedule-empty"><div class="schedule-empty-symbol">${scheduleIcon(filtered ? 'search' : 'calendar')}</div><h3>${filtered ? '没有找到符合条件的任务' : '把下一次执行，交给计划'}</h3><p>${filtered ? '试试其他关键词，或清空筛选查看全部任务。' : '创建提醒或自动执行任务，到时间后将结果发送到群聊。'}</p><button class="button ${filtered ? '' : 'primary'}" ${filtered ? 'data-schedule-reset' : 'data-schedule-new'}>${filtered ? '清空筛选' : '创建第一个任务'}</button>${!filtered ? '<span class="schedule-empty-note">支持单次定时与周期执行</span>' : ''}</div>`;
+    : `<div class="schedule-empty"><div class="schedule-empty-symbol">${scheduleIcon(filtered ? 'search' : 'calendar')}</div><h3>${filtered ? '没有找到符合条件的任务' : '把下一次执行，交给计划'}</h3><p>${filtered ? '试试其他关键词，或清空筛选查看全部任务。' : '创建提醒或自动执行任务，到时间后将结果发送到会话聊。'}</p><button class="button ${filtered ? '' : 'primary'}" ${filtered ? 'data-schedule-reset' : 'data-schedule-new'}>${filtered ? '清空筛选' : '创建第一个任务'}</button>${!filtered ? '<span class="schedule-empty-note">支持单次定时与周期执行</span>' : ''}</div>`;
   return `<div class="schedule-service ${data.enabled && data.running ? 'online' : 'offline'}"><span class="schedule-service-icon">${scheduleIcon('clock')}</span><div class="schedule-service-copy"><strong><span class="schedule-online-dot"></span>${serviceLabel}</strong><span>${serviceNote}</span></div><div class="schedule-service-rule">周期执行<span>至少间隔 <strong>${number((data.minIntervalMs || 3600000) / 60000)} 分钟</strong></span></div></div>
   <section class="panel schedule-access"><div class="schedule-access-heading"><span class="schedule-section-icon">${scheduleIcon('shield')}</span><div><h2>群聊任务权限</h2><p>谁可以在群里登记和管理任务</p></div></div><form data-schedule-permissions data-version="${Number(policy.version)}"><div class="schedule-role-options">${roleOptions.map(([value, title, help]) => `<label><input type="checkbox" name="role" value="${value}"${policy.allowedRoleGroups.includes(value) ? ' checked' : ''}><span><strong>${title}</strong><small>${help}</small></span></label>`).join('')}</div><div class="schedule-permission-actions"><button class="button" type="submit">保存权限</button><span class="form-message" role="status"></span></div></form><p class="schedule-access-note">角色可多选；全不选即关闭群聊登记与管理，已有计划继续执行。<span>系统任务仅可在后台管理。</span></p></section>
   <section class="schedule-board"><div class="schedule-board-heading"><div><h2>任务计划 <span class="schedule-count">${number(data.total)}</span></h2><p>${filtered ? '当前筛选结果' : '统一查看计划，追踪每次执行与消息投递'}</p></div><div class="schedule-heading-actions">${scheduleState.draft ? '<button class="button" data-schedule-draft>继续未保存草稿</button>' : ''}<button class="button primary" data-schedule-new>${scheduleIcon('plus')}创建系统任务</button></div></div>
@@ -893,7 +985,7 @@ async function saveSchedulePermissions(form) {
 function scheduleEditor(item) {
   const zone = item?.timezone || scheduleState.data?.defaultTimezone || 'Asia/Shanghai', spec = item?.scheduleSpec || { kind: 'once', at: Date.now() + 3600000 };
   const value = (name, fallback = '') => esc(item?.[name] ?? fallback);
-  const fields = `<label class="form-field">任务标题<input name="title" required maxlength="200" value="${value('title')}"></label><label class="form-field">目标群<select name="roomId" required${item?.id ? ' disabled' : ''}>${(scheduleState.data?.allowedRoomIds || [item?.roomId]).filter(Boolean).map(id => `<option value="${esc(id)}"${id === item?.roomId ? ' selected' : ''}>${esc(id)}</option>`).join('')}</select></label><label class="form-field">执行方式<select name="executionKind"><option value="worker"${item?.executionKind !== 'reminder' ? ' selected' : ''}>Worker 处理任务</option><option value="reminder"${item?.executionKind === 'reminder' ? ' selected' : ''}>固定文字提醒</option></select></label><label class="form-field">时区<input name="timezone" required value="${esc(zone)}" placeholder="Asia/Shanghai"></label><label class="form-field schedule-wide">收件人成员 ID（可选，可填写多个）<input name="recipientIds" value="${esc((item?.recipientIds || []).join(', '))}" placeholder="例如：301, 302"><span class="panel-description">QQ 群请填 QQ 号，多个 ID 用逗号或空格分隔；投递时逐个 @，留空仅发群消息。</span></label><label class="form-field schedule-wide">执行说明 / 提醒文字<textarea name="content" rows="5" required maxlength="12000">${value('content')}</textarea></label><label class="form-field">时间类型<select name="kind"><option value="once"${spec.kind === 'once' ? ' selected' : ''}>单次定时</option><option value="interval"${spec.kind === 'interval' ? ' selected' : ''}>固定间隔</option><option value="cron"${spec.kind === 'cron' ? ' selected' : ''}>日历循环（cron）</option></select></label><label class="form-field" data-schedule-when="once interval">${spec.kind === 'interval' ? '首次执行时间' : '执行时间'}（所选时区）<input name="localAt" type="datetime-local" value="${esc(typeof spec.at === 'string' ? spec.at : typeof spec.anchorAt === 'string' ? spec.anchorAt : scheduleLocal(spec.at || spec.anchorAt || Date.now() + 3600000, zone))}"></label><label class="form-field" data-schedule-when="interval">间隔（分钟，至少 60）<input name="intervalMinutes" type="number" min="60" step="1" value="${Number(spec.intervalMs || 3600000) / 60000}"></label><label class="form-field schedule-wide" data-schedule-when="cron">五字段 cron<input name="expression" value="${esc(spec.expression || '0 9 * * *')}" placeholder="0 9 * * 1-5"><span class="panel-description">每天 09:00：0 9 * * *；工作日：0 9 * * 1-5。分钟必须为单一数字。</span></label><label class="form-field">结果交付<select name="deliveryMode"><option value="room"${item?.deliveryMode !== 'local' ? ' selected' : ''}>发送到群</option><option value="local"${item?.deliveryMode === 'local' ? ' selected' : ''}>仅保存后台（系统 Worker）</option></select></label><label class="form-field">错过触发<select name="misfirePolicy"><option value="coalesce_once"${item?.misfirePolicy !== 'skip' ? ' selected' : ''}>合并补跑一次</option><option value="skip"${item?.misfirePolicy === 'skip' ? ' selected' : ''}>跳过</option></select></label><label class="form-field">单次硬超时（分钟）<input name="timeoutMinutes" type="number" min="1" max="1440" value="${Number(item?.timeoutMs || 3600000) / 60000}"></label><label class="form-field">补跑有效窗口（小时）<input name="catchUpHours" type="number" min="0" max="720" value="${Number(item?.catchUpWindowMs ?? 86400000) / 3600000}"></label><label class="form-field">最多触发次数（留空不限）<input name="maxRuns" type="number" min="1" value="${value('maxRuns')}"></label><label class="form-field">结束时间（留空不限，所选时区）<input name="expiresAt" type="datetime-local" value="${esc(typeof item?.expiresAt === 'string' ? item.expiresAt : scheduleLocal(item?.expiresAt, zone))}"></label><label class="form-field">所需能力 ID（可选，逗号分隔）<input name="capabilities" value="${esc((item?.requiredCapabilityIds || []).join(', '))}"></label>`;
+  const fields = `<label class="form-field">任务标题<input name="title" required maxlength="200" value="${value('title')}"></label><label class="form-field">目标会话<select name="roomId" required${item?.id ? ' disabled' : ''}>${(scheduleState.data?.allowedRoomIds || [item?.roomId]).filter(Boolean).map(id => `<option value="${esc(id)}"${id === item?.roomId ? ' selected' : ''}>${esc(id)}</option>`).join('')}</select></label><label class="form-field">执行方式<select name="executionKind"><option value="worker"${item?.executionKind !== 'reminder' ? ' selected' : ''}>Worker 处理任务</option><option value="reminder"${item?.executionKind === 'reminder' ? ' selected' : ''}>固定文字提醒</option></select></label><label class="form-field">时区<input name="timezone" required value="${esc(zone)}" placeholder="Asia/Shanghai"></label><label class="form-field schedule-wide">收件人成员 ID（可选，可填写多个）<input name="recipientIds" value="${esc((item?.recipientIds || []).join(', '))}" placeholder="例如：301, 302"><span class="panel-description">QQ 群请填 QQ 号，多个 ID 用逗号或空格分隔；投递时逐个 @，私聊必须留空。</span></label><label class="form-field schedule-wide">执行说明 / 提醒文字<textarea name="content" rows="5" required maxlength="12000">${value('content')}</textarea></label><label class="form-field schedule-wide">绑定文件 ID（私聊 Worker，可选）<input name="attachmentIds" value="${esc((item?.attachmentIds || item?.attachmentRefs?.map(a => a.attachmentId) || []).join(', '))}"><span class="panel-description">填写同一会话已下载的附件 ID；文件版本固定，同名重传需重新选择。</span></label><label class="form-field">时间类型<select name="kind"><option value="once"${spec.kind === 'once' ? ' selected' : ''}>单次定时</option><option value="interval"${spec.kind === 'interval' ? ' selected' : ''}>固定间隔</option><option value="cron"${spec.kind === 'cron' ? ' selected' : ''}>日历循环（cron）</option></select></label><label class="form-field" data-schedule-when="once interval">${spec.kind === 'interval' ? '首次执行时间' : '执行时间'}（所选时区）<input name="localAt" type="datetime-local" value="${esc(typeof spec.at === 'string' ? spec.at : typeof spec.anchorAt === 'string' ? spec.anchorAt : scheduleLocal(spec.at || spec.anchorAt || Date.now() + 3600000, zone))}"></label><label class="form-field" data-schedule-when="interval">间隔（分钟，至少 60）<input name="intervalMinutes" type="number" min="60" step="1" value="${Number(spec.intervalMs || 3600000) / 60000}"></label><label class="form-field schedule-wide" data-schedule-when="cron">五字段 cron<input name="expression" value="${esc(spec.expression || '0 9 * * *')}" placeholder="0 9 * * 1-5"><span class="panel-description">每天 09:00：0 9 * * *；工作日：0 9 * * 1-5。分钟必须为单一数字。</span></label><label class="form-field">结果交付<select name="deliveryMode"><option value="room"${item?.deliveryMode !== 'local' ? ' selected' : ''}>发送到会话</option><option value="local"${item?.deliveryMode === 'local' ? ' selected' : ''}>仅保存后台（系统 Worker）</option></select></label><label class="form-field">错过触发<select name="misfirePolicy"><option value="coalesce_once"${item?.misfirePolicy !== 'skip' ? ' selected' : ''}>合并补跑一次</option><option value="skip"${item?.misfirePolicy === 'skip' ? ' selected' : ''}>跳过</option></select></label><label class="form-field">单次硬超时（分钟）<input name="timeoutMinutes" type="number" min="1" max="1440" value="${Number(item?.timeoutMs || 3600000) / 60000}"></label><label class="form-field">补跑有效窗口（小时）<input name="catchUpHours" type="number" min="0" max="720" value="${Number(item?.catchUpWindowMs ?? 86400000) / 3600000}"></label><label class="form-field">最多触发次数（留空不限）<input name="maxRuns" type="number" min="1" value="${value('maxRuns')}"></label><label class="form-field">结束时间（留空不限，所选时区）<input name="expiresAt" type="datetime-local" value="${esc(typeof item?.expiresAt === 'string' ? item.expiresAt : scheduleLocal(item?.expiresAt, zone))}"></label><label class="form-field">所需能力 ID（可选，逗号分隔）<input name="capabilities" value="${esc((item?.requiredCapabilityIds || []).join(', '))}"></label>`;
   return `<form data-schedule-editor data-id="${esc(item?.id || '')}" data-version="${Number(item?.version || 0)}" data-key="${esc(item?._key || scheduleKey())}"><p class="panel-description">${item?.id ? `正在编辑${item.authority === 'system' ? '系统' : '用户'}任务；级别和请求人保持不变。` : '后台创建的任务为系统级，群聊无法修改。'}</p><div class="schedule-form-grid">${fields}</div><p class="schedule-frequency-note"></p><div class="schedule-actions"><button class="button" type="button" data-schedule-preview>预览未来执行时间</button><button class="button primary" type="submit">${item?.id ? '保存修改' : '创建系统任务'}</button><button class="button" type="button" data-schedule-discard>放弃草稿</button></div><p class="form-message" role="status"></p><div data-schedule-preview-result></div></form>`;
 }
 function syncScheduleFields(form) { const kind = form.elements ? form.elements.namedItem('kind').value : form.querySelector('[name=kind]').value; for (const node of form.querySelectorAll('[data-schedule-when]')) node.hidden = !node.dataset.scheduleWhen.split(' ').includes(kind); form.querySelector('.schedule-frequency-note').textContent = kind === 'once' ? '单次任务没有周期频率限制。' : '周期任务最多每小时执行一次；补跑、立即执行与自动触发共用此限制。'; }
@@ -901,6 +993,7 @@ function readScheduleDraft(form) {
   const field = name => form.querySelector('[name=' + name + ']').value, kind = field('kind');
   const spec = kind === 'once' ? { kind, at: field('localAt') } : kind === 'interval' ? { kind, anchorAt: field('localAt'), intervalMs: Number(field('intervalMinutes')) * 60000 } : { kind, expression: field('expression').trim() };
   const draft = { title: field('title').trim(), roomId: field('roomId'), executionKind: field('executionKind'), deliveryMode: field('deliveryMode') || 'room', content: field('content'), recipientIds: [...new Set(field('recipientIds').split(/[,，\s]+/).filter(Boolean))], timezone: field('timezone').trim(), scheduleSpec: spec, misfirePolicy: field('misfirePolicy'), timeoutMs: Number(field('timeoutMinutes')) * 60000, catchUpWindowMs: Number(field('catchUpHours')) * 3600000, requiredCapabilityIds: field('capabilities').split(/[,，\n]/).map(x => x.trim()).filter(Boolean) };
+  if (form.querySelector('[name=attachmentIds]')) draft.attachmentIds = field('attachmentIds').split(/[,，\s]+/).filter(Boolean);
   if (field('maxRuns')) draft.maxRuns = Number(field('maxRuns')); else if (form.dataset.id) draft.maxRuns = null;
   if (field('expiresAt')) draft.expiresAt = field('expiresAt'); else if (form.dataset.id) draft.expiresAt = null;
   return draft;
@@ -932,7 +1025,7 @@ async function showSchedule(id, runsOffset = 0) {
     const s = detail.schedule; scheduleState.current = s; scheduleState.runsOffset = runsOffset;
     const active = !['completed', 'cancelled'].includes(s.status), controls = [['update', '编辑'], ...(s.status === 'active' ? [['pause', '暂停后续执行']] : ['paused', 'blocked'].includes(s.status) ? [['resume', '恢复']] : []), ...(active ? [['run_now', '立即执行'], ['cancel', '取消计划及当前执行']] : []), ...(!s.archivedAt && !active ? [['archive', '归档']] : [])];
     $('detail-title').textContent = s.title;
-    $('detail-body').innerHTML = `<div class="detail-summary">${badge(s.status)}<span>${s.authority === 'system' ? '系统任务 · 仅后台管理' : '用户任务 · ' + esc(s.ownerId)}</span><span>第 ${number(s.version)} 版</span></div><p class="mono">${esc(s.id)} · ${esc(s.roomId)}</p><p>${esc(scheduleRule(s))} · ${esc(s.timezone)}</p><p>结果交付：${s.deliveryMode === 'local' ? '仅保存后台' : '发送到群'}</p><p>收件人：${s.recipientIds?.length ? esc(s.recipientIds.join('、')) : '未指定'}</p><p>下次执行：${esc(scheduleTime(s.nextRunAt, s.timezone))}</p>${s.stateReason ? '<p class="notice">' + esc(scheduleReason(s.stateReason)) + '</p>' : ''}<p class="answer-body">${esc(s.content)}</p><p class="panel-description">暂停仅停止后续与未开始的执行；取消同时请求停止当前执行。取消会停止后续上传；已上传的文件和已发送的消息无法撤回。</p><div class="schedule-actions">${controls.map(([op, text]) => `<button class="button" data-schedule-op="${op}"${op === 'run_now' && s.nextEligibleAt > Date.now() ? ' disabled' : ''}>${text}</button>`).join('')}</div>${s.nextEligibleAt > Date.now() ? `<p class="panel-description">最早可再次执行：${esc(scheduleTime(s.nextEligibleAt, s.timezone))}</p>` : ''}<p data-schedule-command-message role="status"></p><div data-schedule-confirm></div><h3>执行与投递 · ${number(runs.total)} 次</h3>${(runs.items || []).map(run => `<section class="schedule-run"><div class="detail-summary">${badge(run.status)}<span>计划 ${esc(scheduleTime(run.scheduledAt, s.timezone))}</span><span>开始 ${esc(scheduleTime(run.startedAt, s.timezone))}</span></div><p class="table-sub">${esc(run.reason || run.error || '')}</p><div>投递：${(run.outbox || []).length ? run.outbox.map(row => badge(row.status)).join(' ') : run.deliveryStatus ? badge(run.deliveryStatus) : '尚无投递记录'}</div>${run.tokenUsage ? taskTokenCell(run.tokenUsage) : ''}<div class="schedule-actions">${run.threadId ? `<button class="button small" data-schedule-thread="${esc(run.threadId)}">执行话题与模型轨迹</button>` : ''}${['running', 'queued'].includes(run.status) ? `<button class="button small" data-schedule-op="stop_run" data-schedule-run="${esc(run.id)}">只停止本次执行</button>` : ''}</div>${run.snapshot?.deliveryMode === 'local' && run.result?.report?.shortAnswer ? `<p class="answer-body">${esc(run.result.report.shortAnswer)}</p>` : ''}${(run.outbox || []).map(row => `<p class="answer-body">${esc(replyText(row.data?.message))}</p>${replyImages(row)}${replyFiles(row)}`).join('')}${raw(run, '实例详情')}</section>`).join('') || '<p class="muted">尚无执行记录。</p>'}<div class="schedule-actions"><button class="button small" data-schedule-runs-page="${Math.max(0, runsOffset - 30)}"${runsOffset ? '' : ' disabled'}>上一页</button><button class="button small" data-schedule-runs-page="${runsOffset + 30}"${runs.hasMore ? '' : ' disabled'}>下一页</button><button class="button small" data-schedule-reload>刷新状态</button></div>${raw(detail.audits || [], '最近变更与审计')}${raw(s, '完整计划与授权来源')}`;
+    $('detail-body').innerHTML = `<div class="detail-summary">${badge(s.status)}<span>${s.authority === 'system' ? '系统任务 · 仅后台管理' : '用户任务 · ' + esc(s.ownerId)}</span><span>第 ${number(s.version)} 版</span></div><p class="mono">${esc(s.id)} · ${esc(s.roomId)}</p><p>${esc(scheduleRule(s))} · ${esc(s.timezone)}</p><p>结果交付：${s.deliveryMode === 'local' ? '仅保存后台' : '发送到会话'}</p><p>收件人：${s.recipientIds?.length ? esc(s.recipientIds.join('、')) : '未指定'}</p><p>下次执行：${esc(scheduleTime(s.nextRunAt, s.timezone))}</p>${s.attachmentRefs?.length ? '<h3>绑定文件版本</h3><ul>' + s.attachmentRefs.map(a => '<li>' + esc(a.name) + ' · ' + number(a.bytes) + ' 字节 · <span class="mono">' + esc(a.attachmentId) + '</span><br><span class="mono">' + esc(a.sha256) + '</span></li>').join('') + '</ul>' : ''}${s.stateReason ? '<p class="notice">' + esc(scheduleReason(s.stateReason)) + '</p>' : ''}<p class="answer-body">${esc(s.content)}</p><p class="panel-description">暂停仅停止后续与未开始的执行；取消同时请求停止当前执行。取消会停止后续上传；已上传的文件和已发送的消息无法撤回。</p><div class="schedule-actions">${controls.map(([op, text]) => `<button class="button" data-schedule-op="${op}"${op === 'run_now' && s.nextEligibleAt > Date.now() ? ' disabled' : ''}>${text}</button>`).join('')}</div>${s.nextEligibleAt > Date.now() ? `<p class="panel-description">最早可再次执行：${esc(scheduleTime(s.nextEligibleAt, s.timezone))}</p>` : ''}<p data-schedule-command-message role="status"></p><div data-schedule-confirm></div><h3>执行与投递 · ${number(runs.total)} 次</h3>${(runs.items || []).map(run => `<section class="schedule-run"><div class="detail-summary">${badge(run.status)}<span>计划 ${esc(scheduleTime(run.scheduledAt, s.timezone))}</span><span>开始 ${esc(scheduleTime(run.startedAt, s.timezone))}</span><span>交付截止 ${esc(scheduleTime(run.deliveryExpiresAt, s.timezone))}</span></div><p class="table-sub">${esc(run.reason || run.error || '')}</p><div>投递：${(run.outbox || []).length ? run.outbox.map(row => badge(row.status)).join(' ') : run.deliveryStatus ? badge(run.deliveryStatus) : '尚无投递记录'}</div>${run.tokenUsage ? taskTokenCell(run.tokenUsage) : ''}<div class="schedule-actions">${run.threadId ? `<button class="button small" data-schedule-thread="${esc(run.threadId)}">执行话题与模型轨迹</button>` : ''}${['running', 'queued'].includes(run.status) ? `<button class="button small" data-schedule-op="stop_run" data-schedule-run="${esc(run.id)}">只停止本次执行</button>` : ''}</div>${run.snapshot?.deliveryMode === 'local' && run.result?.report?.shortAnswer ? `<p class="answer-body">${esc(run.result.report.shortAnswer)}</p>` : ''}${(run.outbox || []).map(row => `<p class="answer-body">${esc(replyText(row.data?.message))}</p>${replyImages(row)}${replyFiles(row)}`).join('')}${raw(run, '实例详情')}</section>`).join('') || '<p class="muted">尚无执行记录。</p>'}<div class="schedule-actions"><button class="button small" data-schedule-runs-page="${Math.max(0, runsOffset - 30)}"${runsOffset ? '' : ' disabled'}>上一页</button><button class="button small" data-schedule-runs-page="${runsOffset + 30}"${runs.hasMore ? '' : ' disabled'}>下一页</button><button class="button small" data-schedule-reload>刷新状态</button></div>${raw(detail.audits || [], '最近变更与审计')}${raw(s, '完整计划与授权来源')}`;
   } catch (error) { if (sequence === detailSequence) $('detail-body').innerHTML = '<p class="notice">' + esc(error.message) + '</p>'; }
 }
 async function scheduleCommand(op, runId, button) {

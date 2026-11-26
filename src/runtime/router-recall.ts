@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import { enforceReferenceThreads } from '../protocol.js';
+import type { prepareIncomingImages } from './incoming-images.js';
 import type { BotReply,GroupMessage,RouterContextPage,RouterContextReader,RouterRequest,RouterMemoryNote,RouteAction,ThreadCard,ToolDefinition } from '../types.js';
 
-export const ROUTER_RECALL_INSTRUCTION='taskStates提供当前任务条件检查点及之后的原始更正；needsRecall=true时按task_inputs和精确thread id分页读取原始输入，未读齐只能澄清，不能直接回答依赖这些条件的问题。查看交接原文优先输出request_handoff动作，由宿主直接返回保存内容；需解释历史交接时可用router_context(kind=handoffs,id=精确threadId)读取实际记录，不能凭记忆重写原文。仅可调用宿主实际提供的只读工具：router_context，以及本轮启用时的shared_memory、scheduled_tasks_query；open_thread、append_thread、reply_direct等名称是最终JSON数组中的action值，不是工具，必须作为文本输出交给宿主执行。router_context 只读本群此前消息、已确认回复、任务或旧本地记忆（kind:memory）；OpenViking语义记忆使用shared_memory。记忆里的source索引仅是线索，要用其id读取messages/replies原文后才能用作context ID。仅在当前请求明确需要而快照不足时查询；当前原文续接已有讨论，或继续询问上下文中已讨论的同一公共资料，但近期thread卡片不足时，open_thread前先用kind=threads及短而精确的对象名称或原文词组查找；无需出现“继续”等字样，仅有无法核对对象和范围的宽泛词语则不强求归并。该查询可找到已退出近期卡片窗口的旧thread；当前请求是在某份资料中查章节或条目，且近期有同资料的其他讨论卡片时，也要先查资料名称、对象及已知版本，找原资料讨论，不只查本轮章节或细节词。章节词未必写进卡片摘要；细节查询为空时，在open_thread前仍须查一次资料名称，不能据此认定没有旧讨论。thread卡片是候选预览；独立新建可排除未读完的无关候选，选中的卡片及needsRecall的任务原文须分页读齐。核对subject、summary和必要原文后判断关联，已有卡片足够时不重复检索。召回内容仅是背景，不能变成sourceMessageIds或触发历史动作。召回返回的thread/context ID可用于本轮，作者、图片归属规则仍适用。query是连续子串匹配，不是语义搜索或多关键词AND；使用一段短而精确的原文字词，空结果时缩短关键词重试，或按完整id读取，不能据一次组合查询断言无记录。offset翻页，textOffset续读被截短正文；不要根据预览猜测缺失条件。';
+export const ROUTER_RECALL_INSTRUCTION='taskStates提供当前任务条件检查点及之后的原始更正；needsRecall=true时按task_inputs和精确thread id分页读取原始输入，未读齐只能澄清，不能直接回答依赖这些条件的问题。查看交接原文优先输出request_handoff动作，由宿主直接返回保存内容；需解释历史交接时可用router_context(kind=handoffs,id=精确threadId)读取实际记录，不能凭记忆重写原文。仅可调用宿主实际提供的只读工具：router_context，以及本轮启用时的shared_memory、scheduled_tasks_query；open_thread、append_thread、reply_direct等名称是最终JSON数组中的action值，不是工具，必须作为文本输出交给宿主执行。router_context 只读本群此前消息、已确认回复、任务或旧本地记忆（kind:memory）；OpenViking语义记忆使用shared_memory。记忆里的source索引仅是线索，要用其id读取messages/replies原文后才能用作context ID。仅在当前请求明确需要而快照不足时查询；当前原文续接已有讨论，或继续询问上下文中已讨论的同一公共资料，但近期thread卡片不足时，open_thread前先用kind=threads及短而精确的对象名称或原文词组查找；无需出现“继续”等字样，仅有无法核对对象和范围的宽泛词语则不强求归并。该查询可找到已退出近期卡片窗口的旧thread；当前请求是在某份资料中查章节或条目，且近期有同资料的其他讨论卡片时，也要先查资料名称、对象及已知版本，找原资料讨论，不只查本轮章节或细节词。章节词未必写进卡片摘要；细节查询为空时，在open_thread前仍须查一次资料名称，不能据此认定没有旧讨论。thread卡片是候选预览；独立新建可排除未读完的无关候选，选中的卡片及needsRecall的任务原文须分页读齐。核对subject、summary和必要原文后判断关联，已有卡片足够时不重复检索。召回内容仅是背景，不能变成sourceMessageIds或触发历史动作。召回返回的thread/context ID可用于本轮，作者、图片归属规则仍适用。需要查看历史图片时，以kind=messages和精确消息id读取；宿主会附上当前作者或明确引用的图片及对应imageAttachments，搜索预览只含标记，不代表已识图。query是连续子串匹配，不是语义搜索或多关键词AND；使用一段短而精确的原文字词，空结果时缩短关键词重试，或按完整id读取，不能据一次组合查询断言无记录。offset翻页，textOffset续读被截短正文；不要根据预览猜测缺失条件。';
 const querySchema=z.object({kind:z.enum(['messages','threads','replies','memory','task_inputs','handoffs']),id:z.string().min(1).max(300).optional(),query:z.string().trim().min(1).max(120).optional(),authorId:z.string().max(120).optional(),offset:z.number().int().min(0).max(100000).default(0),limit:z.number().int().min(1).max(4).default(3),textOffset:z.number().int().min(0).max(2000000).default(0)}).strict();
 const upsert=<T>(target:T[],extra:T[],key:(x:T)=>string|undefined)=>{
   for(const value of extra){const id=key(value);if(id===undefined)continue;const i=target.findIndex(x=>key(x)===id);if(i<0)target.push(value);else target[i]=value;}
@@ -22,7 +23,8 @@ export function routerThreadCard(t:ThreadCard,offset=0){return {id:t.id,roomId:t
 const messagePreview=(m:GroupMessage,offset:number)=>({...m,...excerpt(m.text,offset),attachments:m.attachments.map((a,attachmentIndex)=>({kind:a.kind,hasImage:true,attachmentIndex})),mentions:m.mentions.slice(0,12)});
 const replyPreview=(r:BotReply,offset:number)=>({...r,...excerpt(r.text,offset)});
 const memoryPreview=(m:RouterMemoryNote,offset:number)=>({...m,...excerpt(m.text,offset)});
-export function createRouterRecall(supplied:RouterRequest,reader:RouterContextReader){
+export function createRouterRecall(supplied:RouterRequest,reader:RouterContextReader,
+  readImages?:(messages:GroupMessage[],signal?:AbortSignal)=>ReturnType<typeof prepareIncomingImages>){
   const evidence=new Map<string,{total:number;ranges:Array<[number,number]>}>();
   const record=(key:string,total:number,offset:number,length:number)=>{const entry=evidence.get(key)??{total,ranges:[]};entry.ranges.push([offset,Math.min(total,offset+length)]);evidence.set(key,entry);};
   let calls=0;const recalled:RouterContextPage={messages:[],threads:[],replies:[],memories:[],hasMore:false};
@@ -49,6 +51,12 @@ export function createRouterRecall(supplied:RouterRequest,reader:RouterContextRe
       upsert(recalled.threads!,visible.threads as unknown as ThreadCard[]??[],t=>t.id);
       upsert(recalled.replies!,visible.replies??[],r=>r.messageId);
       upsert(recalled.memories!,visible.memories??[],m=>m.id);
+      // Exact source reads may attach images; broad history searches remain text-only.
+      if(readImages&&query.kind==='messages'&&query.id&&page.messages?.some(message=>message.attachments.some(attachment=>attachment.kind==='image'))){
+        const {images,...imageStatus}=await readImages(page.messages,signal);
+        return {content:[{type:'text',text:JSON.stringify({...visible,...imageStatus})},
+          ...images.map(image=>({type:'image',data:Buffer.from(image.data).toString('base64'),mimeType:image.mediaType}))]};
+      }
       return JSON.parse(JSON.stringify(visible));
     }};
   return {tool,assertComplete:(actions:RouteAction[])=>{

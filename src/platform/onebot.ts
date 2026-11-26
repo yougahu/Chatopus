@@ -1,5 +1,9 @@
+import type {PrivateFileContract} from './private-files.js';
+import {resolve,relative,isAbsolute} from 'node:path';
+import {PrivateChatAccess,type PrivateChatSettings,type AccessLease} from '../private-chat.js';
+import {parseQqRoomId,formatQqRoomId,type QqConversation} from '../conversation.js';
 import { createServer, type Server } from 'node:http';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import type { Attachment, GroupMessage, OutgoingFile, OutgoingMessage, PublisherPort, SendReceipt } from '../types.js';
 import { MAX_OUTPUT_IMAGE_COUNT, MAX_OUTPUT_TOTAL_BYTES, readOutgoingImage } from '../output-images.js';
@@ -23,6 +27,9 @@ export interface OneBotOptions {
   selfId: string;
   accessToken: string;
   allowedGroupIds: string[];
+  privateChat?:Partial<PrivateChatSettings>;
+  privateFiles?:PrivateFileContract;
+  privateAccess?:PrivateChatAccess;
   host?: '127.0.0.1' | '::1';
   port?: number;
   path?: string;
@@ -36,11 +43,16 @@ export interface OneBotOptions {
 }
 
 /** Authenticated transport supplies identity; CQ-looking user text is always literal. */
-export function normalizeOneBotMessage(event: unknown, selfId: string, allowedGroups: ReadonlySet<string>): GroupMessage | undefined {
+export function normalizeOneBotMessage(event: unknown, selfId: string, allowedGroups: ReadonlySet<string>, privateAccess?:PrivateChatAccess): GroupMessage | undefined {
   const p = object(event);
-  if (!p || p.post_type !== 'message' || p.message_type !== 'group' || id(p.self_id) !== selfId) return;
-  const authorId = id(p.user_id), groupId = id(p.group_id), messageId = id(p.message_id, true);
-  if (!authorId || authorId === selfId || !groupId || !allowedGroups.has(groupId) || !messageId || !Array.isArray(p.message)) return;
+  if (!p || p.post_type !== 'message' || !['group','private'].includes(String(p.message_type)) || id(p.self_id) !== selfId) return;
+  const authorId = id(p.user_id), groupId = id(p.group_id), messageId = id(p.message_id, true), isPrivate=p.message_type==='private';
+  if (!authorId || authorId === selfId || !messageId) return;
+  if(isPrivate){
+    if(p.sub_type!=='friend'||!privateAccess?.allows(`qq:${selfId}:private:${authorId}`))return;
+    const senderId=object(p.sender)?.user_id;if(senderId!==undefined&&id(senderId)!==authorId)return;
+  }else if(!groupId||!allowedGroups.has(groupId))return;
+  if(!Array.isArray(p.message))return;
   const mentions: string[] = [], attachments: Attachment[] = [], text: string[] = [];
   let replyToMessageId: string | undefined;
   for (const item of p.message) {
@@ -55,18 +67,23 @@ export function normalizeOneBotMessage(event: unknown, selfId: string, allowedGr
       ...(typeof data.file === 'string' ? { file: data.file } : {}),
       ...(typeof data.url === 'string' ? { url: data.url } : {}),
     });
+    else if(isPrivate&&segment.type==='file'){
+      const name=typeof data.name==='string'?data.name:typeof data.file_name==='string'?data.file_name:'文件';
+      attachments.push({kind:'file',name,...(typeof data.file_id==='string'?{file:data.file_id}:{}),
+        ...(typeof data.url==='string'?{url:data.url}:{}),...(typeof data.size==='number'?{bytes:data.size}:{})});
+    }
     else if (typeof segment.type === 'string') text.push(`[${segment.type}]`);
   }
   const sender = object(p.sender) ?? {};
   const authorName = [sender.card, sender.nickname].find(x => typeof x === 'string' && x.trim()) as string | undefined;
-  const roomId = `qq:${selfId}:${groupId}`;
+  const roomId = isPrivate?`qq:${selfId}:private:${authorId}`:`qq:${selfId}:${groupId}`;
   return {
     id: `${roomId}:${messageId}`, platform: 'qq', roomId, messageId, authorId,
     authorName: authorName ?? authorId, text: text.join('').trim(),
     timestamp: typeof p.time === 'number' && Number.isFinite(p.time) ? p.time * 1000 : Date.now(),
     replyToMessageId, mentions, attachments,
-    isMentioned: mentions.includes(selfId), isAdmin: sender.role === 'owner' || sender.role === 'admin',
-    memberRoleGroup:sender.role==='owner'||sender.role==='admin'?'group_admin':sender.role==='member'?'member':'unknown',
+    isMentioned: mentions.includes(selfId), isAdmin: !isPrivate&&(sender.role === 'owner' || sender.role === 'admin'),
+    memberRoleGroup:isPrivate?'unknown':sender.role==='owner'||sender.role==='admin'?'group_admin':sender.role==='member'?'member':'unknown',
     roleVerifiedAt:Date.now(),
   };
 }
@@ -83,6 +100,10 @@ interface PendingAction {
 
 /** OneBot reverse WS server; construction is inert, start() explicitly binds loopback. */
 export class OneBotAdapter implements PublisherPort {
+  readonly privateAccess:PrivateChatAccess;
+  private deliveryGuard?:(key:string,roomId:string)=>boolean;
+  private friends=new Map<string,number>();
+  private verifiedFileConnection?:WebSocket;
   private readonly groups: Set<string>;
   private server?: Server;
   private wss?: WebSocketServer;
@@ -98,7 +119,8 @@ export class OneBotAdapter implements PublisherPort {
 
   constructor(private readonly options: OneBotOptions) {
     if (!id(options.selfId) || !options.accessToken) throw new Error('OneBot requires selfId and accessToken');
-    if (!options.allowedGroupIds.length || options.allowedGroupIds.some(x => !id(x))) throw new Error('Explicit allowedGroupIds are required');
+    if (options.allowedGroupIds.some(x => !id(x))) throw new Error('Invalid allowedGroupIds');
+    this.privateAccess=options.privateAccess??new PrivateChatAccess(options.selfId,options.privateChat);
     if (options.host && !['127.0.0.1', '::1'].includes(options.host)) throw new Error('OneBot listener must use loopback');
     if (options.path && (!options.path.startsWith('/') || /[?#]/.test(options.path))) throw new Error('Invalid WebSocket path');
     if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535)) throw new Error('Invalid port');
@@ -136,6 +158,7 @@ export class OneBotAdapter implements PublisherPort {
   }
 
   private attach(ws: WebSocket): void {
+    this.friends.clear();
     if (this.connection) {
       this.failConnection(this.connection, 'connection_replaced');
       this.connection.close(1001, 'Replaced');
@@ -157,9 +180,15 @@ export class OneBotAdapter implements PublisherPort {
         if (pending?.socket === ws) { clearTimeout(pending.timer); this.pending.delete(packet.echo); pending.resolve(packet); }
         return;
       }
-      const message = normalizeOneBotMessage(packet, this.options.selfId, this.groups);
+      if(packet.post_type==='notice'){
+        if(this.jobs.size>=(this.options.maxPendingEvents??1000))return;
+        const job=this.fileNotice(packet).catch(()=>{this.options.onError?.('private_file_notice_rejected');}).finally(()=>this.jobs.delete(job));this.jobs.add(job);return;
+      }
+      const message = normalizeOneBotMessage(packet, this.options.selfId, this.groups,this.privateAccess);
+      if(message&&this.options.privateFiles?.source==='offline_file')message.attachments=message.attachments.filter(a=>a.kind!=='file');
       if (!message || this.incoming.has(message.id) || this.seen.has(message.id)) return;
       if (this.jobs.size >= (this.options.maxPendingEvents ?? 1000)) { this.options.onError?.('input_overflow', message.id); return; }
+      if(parseQqRoomId(message.roomId)?.kind==='private')this.friends.set(message.authorId,Date.now());
       this.incoming.add(message.id);
       // Enter the handler immediately: Coordinator persists intake before its
       // first await, including when shutdown starts in the next microtask.
@@ -180,7 +209,7 @@ export class OneBotAdapter implements PublisherPort {
     }
   }
 
-  async call(action: 'send_group_msg' | 'upload_group_file' | 'get_image' | 'get_msg' | 'get_group_member_info', params: Json): Promise<Json> {
+  async call(action: 'send_group_msg' | 'upload_group_file' | 'get_image' | 'get_msg' | 'get_group_member_info' | 'send_private_msg' | 'upload_private_file' | 'get_friend_list' | 'get_private_file_url' | 'get_version_info', params: Json): Promise<Json> {
     const ws = this.connection;
     if (!ws || ws.readyState !== WebSocket.OPEN || this.closing) throw new OneBotActionError('not_connected', false);
     if (this.pending.size >= 100) throw new OneBotActionError('too_many_pending_actions', false);
@@ -188,7 +217,7 @@ export class OneBotAdapter implements PublisherPort {
     const reply = await new Promise<Json>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(echo); reject(new OneBotActionError('timeout', true));
-      }, this.options.actionTimeoutMs ?? (action === 'upload_group_file' ? 120000 : 15000));
+      }, this.options.actionTimeoutMs ?? (action.startsWith('upload_') ? 120000 : 15000));
       this.pending.set(echo, { socket: ws, resolve, reject, timer });
       ws.send(JSON.stringify({ action, params, echo }), error => {
         if (error && this.pending.delete(echo)) { clearTimeout(timer); reject(new OneBotActionError('write_failed', true)); }
@@ -201,18 +230,21 @@ export class OneBotAdapter implements PublisherPort {
       // a timeout after QQ may have received the file. Only schema/unknown-API
       // rejection proves that this action never entered the handler.
       if (![1400, 1404].includes(reply.retcode)) {
-        if(action === 'upload_group_file')throw new OneBotActionError('upload_result_unknown', true,reply.retcode);
-        if(action === 'send_group_msg')throw new OneBotActionError('send_result_unknown', true,reply.retcode);
+        if(action === 'upload_group_file'||action==='upload_private_file')throw new OneBotActionError('upload_result_unknown', true,reply.retcode);
+        if(action === 'send_group_msg'||action==='send_private_msg')throw new OneBotActionError('send_result_unknown', true,reply.retcode);
       }
       throw new OneBotActionError('action_failed', true,reply.retcode);
     }
+    if(action==='upload_private_file'&&reply.status==='ok'&&reply.data===null&&this.options.privateFiles?.receipt==='synchronous'&&this.verifiedFileConnection===ws)return {};
+    if(action==='get_friend_list'&&reply.status==='ok'&&Array.isArray(reply.data))return {friends:reply.data};
     if (reply.status !== 'ok' || !object(reply.data)) throw new OneBotActionError('invalid_response', true);
     return reply.data as Json;
   }
 
   async send(message: OutgoingMessage, dedupeKey: string): Promise<SendReceipt> {
-    const match = /^qq:([0-9]+):([0-9]+)$/.exec(message.roomId);
-    if (!match || match[1] !== this.options.selfId || !this.groups.has(match[2])) return { status: 'failed', reason: 'invalid_room_scope' };
+    const room=this.allowedRoom(message.roomId);
+    if(!room)return {status:'failed',reason:'invalid_room_scope'};
+    if(room.kind==='private'&&message.recipientIds?.length)return {status:'failed',reason:'invalid_recipient_ids'};
     if (!dedupeKey || typeof message.text !== 'string' || message.text.length > 20000
       || (message.attachments !== undefined && !Array.isArray(message.attachments))
       || (message.files !== undefined && (!Array.isArray(message.files) || message.files.length > 0))) return { status: 'failed', reason: 'unsupported_output' };
@@ -228,7 +260,7 @@ export class OneBotAdapter implements PublisherPort {
     const signature = JSON.stringify(message);
     const prior = this.sends.get(dedupeKey);
     if (prior) return signature === prior.signature ? prior.promise : { status: 'failed', reason: 'dedupe_key_conflict' };
-    const promise = this.transmit(message, match[2]);
+    const promise = this.transmit(message,room,dedupeKey);
     this.sends.set(dedupeKey, { signature, promise });
     const result = await promise;
     // Definite failure can be retried; unknown delivery must never be blindly retried.
@@ -239,14 +271,14 @@ export class OneBotAdapter implements PublisherPort {
 
   /** The coordinator persists each file receipt before sending the next part. */
   async uploadFile(roomId: string, file: OutgoingFile, dedupeKey: string): Promise<SendReceipt> {
-    const match = /^qq:([0-9]+):([0-9]+)$/.exec(roomId);
-    if (!match || match[1] !== this.options.selfId || !this.groups.has(match[2])) return { status: 'failed', reason: 'invalid_room_scope' };
+    const room=this.allowedRoom(roomId);
+    if(!room)return {status:'failed',reason:'invalid_room_scope'};
     if (!dedupeKey || !this.options.outputRoot) return { status: 'failed', reason: 'unsupported_output' };
     if (!object(file)) return { status: 'failed', reason: 'invalid_output_file' };
     const snapshot = { ...file }, signature = JSON.stringify({ roomId, file: snapshot });
     const prior = this.uploads.get(dedupeKey);
     if (prior) return signature === prior.signature ? prior.promise : { status: 'failed', reason: 'dedupe_key_conflict' };
-    const promise = this.transmitFile(snapshot, match[2]);
+    const promise = this.transmitFile(snapshot,room,dedupeKey);
     this.uploads.set(dedupeKey, { signature, promise });
     const result = await promise;
     if (result.status === 'failed' || result.status === 'deferred') this.uploads.delete(dedupeKey);
@@ -254,15 +286,25 @@ export class OneBotAdapter implements PublisherPort {
     return result;
   }
 
-  private async transmitFile(file: OutgoingFile, groupId: string): Promise<SendReceipt> {
+  private async transmitFile(file: OutgoingFile, room:QqConversation, key:string): Promise<SendReceipt> {
+    const roomId=formatQqRoomId(room),lease=room.kind==='private'?this.privateAccess.capture(roomId):undefined;
     let bytes: Buffer;
     try { bytes = await readOutgoingFile(file, this.options.outputRoot!); }
     catch { return { status: 'failed', reason: 'invalid_output_file' }; }
     try {
       // Transfer validated bytes so the bridge does not need access to host paths.
-      const data = await this.call('upload_group_file', { group_id: groupId, file: `base64://${bytes.toString('base64')}`, name: file.name, upload_file: true });
+      const denied=await this.preparePrivate(room,lease);if(denied)return denied;
+      if(room.kind==='private')try{await this.verifyFileContract();}catch{return {status:'failed',reason:'private_file_unsupported',retryable:false};}
+      let transportFile=`base64://${bytes.toString('base64')}`;
+      if(room.kind==='private'&&this.options.privateFiles?.transport==='shared_path'){
+        const root=resolve(this.options.privateFiles.sharedRoot!),target=resolve(file.file),rel=relative(root,target);
+        if(!rel||rel.startsWith('..')||isAbsolute(rel))return {status:'failed',reason:'private_file_unsupported'};
+        transportFile=target;
+      }
+      if(!this.sendAllowed(roomId,key,lease))return {status:'failed',reason:'private_access_denied'};
+      const data = await this.call(room.kind==='private'?'upload_private_file':'upload_group_file', { ...(room.kind==='private'?{user_id:room.peerId}:{group_id:room.groupId}), file: transportFile, name: file.name, upload_file: true });
       const fileId = typeof data.file_id === 'string' && data.file_id.trim() && data.file_id.length <= 1024 && !/[\x00-\x1f\x7f]/.test(data.file_id) ? data.file_id : undefined;
-      return fileId ? { status: 'sent', platformFileId: fileId } : { status: 'unknown', reason: 'missing_file_id' };
+      return fileId ? { status: 'sent', platformFileId: fileId } : room.kind==='private'&&this.options.privateFiles?.receipt==='synchronous'?{status:'sent'}:{ status: 'unknown', reason: 'missing_file_id' };
     } catch (error) {
       const known = error instanceof OneBotActionError;
       if (known && !error.sent) return { status: 'deferred', reason: error.code };
@@ -279,7 +321,8 @@ export class OneBotAdapter implements PublisherPort {
     return {roleGroup:data.role==='owner'||data.role==='admin'?'group_admin':data.role==='member'?'member':'unknown',verifiedAt:Date.now()};
   }
 
-  private async transmit(message: OutgoingMessage, groupId: string): Promise<SendReceipt> {
+  private async transmit(message: OutgoingMessage, room:QqConversation,key:string): Promise<SendReceipt> {
+    const lease=room.kind==='private'?this.privateAccess.capture(message.roomId):undefined;
     const images: Buffer[] = [];
     try {
       let totalBytes = 0;
@@ -293,13 +336,15 @@ export class OneBotAdapter implements PublisherPort {
       }
     } catch { return { status: 'failed', reason: 'invalid_output_image' }; }
     const segments = [
-      ...(message.replyToMessageId ? [{ type: 'reply', data: { id: message.replyToMessageId } }] : []),
+      ...(message.replyToMessageId&&message.quoteReply!==false ? [{ type: 'reply', data: { id: message.replyToMessageId } }] : []),
       ...(message.recipientIds??[]).flatMap(qq=>[{type:'at',data:{qq}},{type:'text',data:{text:' '}}]),
       ...(message.text.trim() ? [{ type: 'text', data: { text: message.text } }] : []),
       ...images.map(data => ({ type: 'image', data: { file: `base64://${data.toString('base64')}` } })),
     ];
     try {
-      const data = await this.call('send_group_msg', { group_id: groupId, message: segments });
+      const denied=await this.preparePrivate(room,lease);if(denied)return denied;
+      if(!this.sendAllowed(message.roomId,key,lease))return {status:'failed',reason:'private_access_denied'};
+      const data = await this.call(room.kind==='private'?'send_private_msg':'send_group_msg', { ...(room.kind==='private'?{user_id:room.peerId}:{group_id:room.groupId}), message: segments });
       const messageId = id(data.message_id, true);
       return messageId ? { status: 'sent', platformMessageId: messageId } : { status: 'unknown', reason: 'missing_message_id' };
     } catch (error) {
@@ -308,6 +353,65 @@ export class OneBotAdapter implements PublisherPort {
       return { status: known && error.code === 'action_failed' ? 'failed' : 'unknown', reason: known ? error.code : 'send_error',
         ...(known&&error.platformCode!==undefined?{platformCode:error.platformCode}:{}),...(known&&error.code==='action_failed'?{retryable:false}:{}) };
     }
+  }
+
+  private allowedRoom(roomId:string){
+    const room=parseQqRoomId(roomId);
+    return room&&room.botId===this.options.selfId&&(room.kind==='private'?this.privateAccess.allows(roomId):this.groups.has(room.groupId))?room:undefined;
+  }
+  setDeliveryGuard(guard:(key:string,roomId:string)=>boolean){this.deliveryGuard=guard;}
+  private async verifyFileContract(){
+    const contract=this.options.privateFiles,connection=this.connection;
+    if(!contract||!connection)throw new Error('private_file_unsupported');
+    if(this.verifiedFileConnection===connection)return;
+    const info=await this.call('get_version_info',{});
+    if(this.connection!==connection||info.app_name!==contract.implementation||info.app_version!==contract.version)throw new Error('private_file_unsupported');
+    this.verifiedFileConnection=connection;
+  }
+  async privateFileUrl(roomId:string,attachment:Attachment):Promise<string|undefined>{
+    const lease=this.privateAccess.capture(roomId);await this.verifyFileContract();this.privateAccess.assert(lease);
+    if(attachment.url)return attachment.url;
+    if(!attachment.file)throw new Error('file_url_unavailable');
+    const room=parseQqRoomId(roomId)!;
+    if(room.kind!=='private')throw new Error('invalid_room_scope');
+    const result=await this.call('get_private_file_url',{user_id:room.peerId,file_id:attachment.file});this.privateAccess.assert(lease);
+    if(typeof result.url!=='string')throw new Error('file_url_unavailable');return result.url;
+  }
+  private async fileNotice(packet:Json){
+    // No content access until transport identity, subtype and current policy pass.
+    const peer=id(packet.user_id),roomId=`qq:${this.options.selfId}:private:${peer}`;
+    if(this.options.privateFiles?.source!=='offline_file'||packet.notice_type!=='offline_file'||id(packet.self_id)!==this.options.selfId
+      ||!peer||peer===this.options.selfId||packet.sub_type!==undefined&&packet.sub_type!=='friend'||!this.privateAccess.allows(roomId))return;
+    const lease=this.privateAccess.capture(roomId);await this.verifyFileContract();this.privateAccess.assert(lease);
+    if(!await this.verifyFriend(roomId))return;this.privateAccess.assert(lease);
+    const file=object(packet.file);
+    if(!file||typeof file.name!=='string'||typeof file.url!=='string'||typeof file.size!=='number'||!Number.isFinite(packet.time)||Number(packet.time)<=0)return;
+    const identity=createHash('sha256').update(JSON.stringify([roomId,packet.time,file.name,file.size,file.url,file.id??null])).digest('hex');
+    const key=roomId+':file:'+identity;if(this.incoming.has(key)||this.seen.has(key))return;
+    this.incoming.add(key);
+    try{
+      this.privateAccess.assert(lease);
+      await this.options.onMessage({id:key,roomId,platform:'qq',messageId:'',authorId:peer,authorName:peer,text:'',timestamp:Number(packet.time)*1000,
+        mentions:[],isMentioned:false,isAdmin:false,memberRoleGroup:'unknown',roleVerifiedAt:Date.now(),
+        attachments:[{kind:'file',name:file.name,url:file.url,bytes:file.size,...(typeof file.id==='string'?{file:file.id}:{})}]});
+      this.seen.set(key,Date.now());while(this.seen.size>10000)this.seen.delete(this.seen.keys().next().value!);
+    }finally{this.incoming.delete(key);}
+  }
+  private sendAllowed(roomId:string,key:string,lease?:AccessLease){return !!this.allowedRoom(roomId)&&(!lease||this.privateAccess.valid(lease))&&(!this.deliveryGuard||this.deliveryGuard(key,roomId));}
+  async verifyFriend(roomId:string):Promise<boolean>{
+    const room=this.allowedRoom(roomId);if(!room||room.kind!=='private')return false;
+    const lease=this.privateAccess.capture(roomId),now=Date.now();
+    if(now-(this.friends.get(room.peerId)??0)<=60000)return true;
+    const data=await this.call('get_friend_list',{});this.privateAccess.assert(lease);
+    if(!Array.isArray(data.friends))throw new Error('invalid_friend_list');
+    this.friends.clear();for(const friend of data.friends){const peer=id(object(friend)?.user_id);if(peer)this.friends.set(peer,Date.now());}
+    return this.friends.has(room.peerId);
+  }
+  private async preparePrivate(room:QqConversation,lease?:AccessLease):Promise<SendReceipt|undefined>{
+    if(room.kind!=='private')return;
+    try{if(!await this.verifyFriend(formatQqRoomId(room)))return {status:'failed',reason:'friend_unavailable',retryable:false};}
+    catch{return {status:'deferred',reason:'friend_verification_unavailable'};}
+    if(!lease||!this.privateAccess.valid(lease))return {status:'failed',reason:'private_access_denied',retryable:false};
   }
 
   /** Stop ingress and settle platform calls before the coordinator cancels model work. */

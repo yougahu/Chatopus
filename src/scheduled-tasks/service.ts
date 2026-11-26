@@ -1,3 +1,4 @@
+import {isPrivateRoom} from '../conversation.js';
 import {createHash,randomUUID} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {z} from 'zod';
@@ -6,7 +7,7 @@ import {assertFreshActor,assertManageable,assertReadable} from './policy.js';
 import {nextOccurrence,previewSchedule,scheduleSpecSchema,validateScheduleSpec} from './schedule-spec.js';
 import {HOUR_MS,ScheduleError,type Schedule,type ScheduleActor,type ScheduleBinding,type ScheduleCommand,type ScheduleCommandOp,type ScheduleInput,type ScheduleMaterializer,type ScheduleMutation,type ScheduleOptions,type SchedulePage,type ScheduleQuery,type ScheduleRun,type ScheduleRunStatus,type ScheduleAccessPolicy,type ScheduleSpec} from './types.js';
 export * from './types.js';
-const inputSchema=z.strictObject({deliveryMode:z.enum(['room','local']).optional(),roomId:z.string().min(1).max(200),title:z.string().trim().min(1).max(200),executionKind:z.enum(['reminder','worker']),content:z.string().trim().min(1).max(12000),recipientIds:recipientIdsSchema.optional(),scheduleSpec:scheduleSpecSchema,
+const inputSchema=z.strictObject({attachmentRefs:z.array(z.strictObject({sourceInputId:z.string().min(1),attachmentId:z.string().min(1),name:z.string().min(1).max(255),bytes:z.number().int().positive().max(10*1024**2),sha256:z.string().regex(/^[a-f0-9]{64}$/)})).max(4).optional(),deliveryMode:z.enum(['room','local']).optional(),roomId:z.string().min(1).max(200),title:z.string().trim().min(1).max(200),executionKind:z.enum(['reminder','worker']),content:z.string().trim().min(1).max(12000),recipientIds:recipientIdsSchema.optional(),scheduleSpec:scheduleSpecSchema,
   timezone:z.string().min(1).max(100).optional(),misfirePolicy:z.enum(['coalesce_once','skip']).optional(),expiresAt:z.number().int().positive().optional(),maxRuns:z.number().int().min(1).max(100000).optional(),catchUpWindowMs:z.number().int().min(0).max(30*24*HOUR_MS).optional(),timeoutMs:z.number().int().min(1000).max(24*HOUR_MS).optional(),requiredCapabilityIds:z.array(z.string().min(1).max(200)).max(64).optional(),businessProfileId:z.string().min(1).max(200).optional()});
 const clone=<T>(value:T):T=>structuredClone(value);
 const canonical=(value:unknown):string=>JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))):item);
@@ -14,7 +15,9 @@ const decode=<T>(row:unknown):T=>JSON.parse((row as {data:string}).data);
 const activeStatuses=new Set(['active','paused','blocked']);
 let transactionSequence=0;
 export class ScheduledTaskService {
-  readonly options:Required<Omit<ScheduleOptions,'allowedRoomIds'>> & Pick<ScheduleOptions,'allowedRoomIds'>;
+  deliveryOutstanding?:(runId:string)=>boolean|undefined;
+  validateExecution?:(schedule:Schedule)=>void;
+  readonly options:Required<Omit<ScheduleOptions,'allowedRoomIds'|'canAccessRoom'>> & Pick<ScheduleOptions,'allowedRoomIds'|'canAccessRoom'>;
   constructor(readonly db:DatabaseSync,options:ScheduleOptions={}){
     this.options={now:Date.now,defaultTimezone:'Asia/Shanghai',minIntervalMs:HOUR_MS,maxPerOwner:20,maxPerRoom:100,maxSchedules:1000,failureThreshold:3,catchUpWindowMs:24*HOUR_MS,timeoutMs:HOUR_MS,commandTtlMs:300000,roleMaxAgeMs:300000,...options};
     if(this.options.minIntervalMs<HOUR_MS)throw new ScheduleError('FREQUENCY_LIMIT','周期任务最多每小时执行一次。');
@@ -50,7 +53,7 @@ export class ScheduledTaskService {
     return this.transaction(()=>{const policy=this.readPolicy();this.version(policy.version,expectedVersion);const next={allowedRoleGroups:parsed.data,version:policy.version+1,updatedAt:this.now(),updatedBy:actor.id??'local-admin'};this.db.prepare('UPDATE schedule_access_policy SET version=?,data=? WHERE id=1').run(next.version,JSON.stringify(next));this.audit('policy_updated',next);return next;});
   }
   private version(actual:number,expected:number){if(!Number.isInteger(expected)||actual!==expected)throw new ScheduleError('VERSION_CONFLICT','任务或权限配置已被修改，请重新读取。',409,{actualVersion:actual});}
-  private permittedRoom(roomId:string){if(this.options.allowedRoomIds&&!this.options.allowedRoomIds.includes(roomId))throw new ScheduleError('ROOM_NOT_ALLOWED','目标群不在允许列表中。',403);}
+  private permittedRoom(roomId:string){if(this.options.canAccessRoom?!this.options.canAccessRoom(roomId):this.options.allowedRoomIds&&!this.options.allowedRoomIds.includes(roomId))throw new ScheduleError('ROOM_NOT_ALLOWED','目标群不在允许列表中。',403);}
   private fresh(actor:ScheduleActor){assertFreshActor(actor,this.readPolicy(),this.now(),this.options.roleMaxAgeMs);if(actor.kind==='user')this.permittedRoom(actor.roomId);}
   private raw(id:string):Schedule{const row=this.db.prepare('SELECT data FROM schedules WHERE id=?').get(id);if(!row)throw new ScheduleError('NOT_FOUND','任务不存在或无权访问。',404);return decode(row);}
   get(actor:ScheduleActor,id:string):Schedule{const s=this.raw(id);assertReadable(actor,s,this.readPolicy(),this.now(),this.options.roleMaxAgeMs);return s;}
@@ -60,9 +63,10 @@ export class ScheduledTaskService {
   private bounds(query:{offset?:number;limit?:number}){const offset=query.offset??0,limit=query.limit??25;if(!Number.isInteger(offset)||offset<0||offset>100000||!Number.isInteger(limit)||limit<1||limit>100)throw new ScheduleError('INVALID_PAGE','分页参数无效。');return {offset,limit};}
   private page<T>(items:T[],query:{offset?:number;limit?:number}):SchedulePage<T>{const {offset,limit}=this.bounds(query),hasMore=offset+limit<items.length;return {items:items.slice(offset,offset+limit),total:items.length,hasMore,...(hasMore?{nextOffset:offset+limit}:{})};}
   list(actor:ScheduleActor,query:ScheduleQuery={}):SchedulePage<Schedule & {canManage:boolean}>{
-    this.bounds(query);if(actor.kind==='user'&&query.scope==='room_users'){this.fresh(actor);if(actor.roleGroup!=='group_admin')throw new ScheduleError('FORBIDDEN','仅获准的群主或管理员可查询本群用户任务。',403);}
+    this.bounds(query);if(actor.kind==='user'&&query.scope==='room_users'){this.fresh(actor);if(actor.accessKind==='private'||actor.roleGroup!=='group_admin')throw new ScheduleError('FORBIDDEN','仅获准的群主或管理员可查询本群用户任务。',403);}
     const all=this.db.prepare('SELECT data FROM schedules ORDER BY rowid DESC').all().map(row=>decode<Schedule>(row));
     const items=all.filter(s=>{
+      if(query.conversationKind&&(isPrivateRoom(s.roomId)?'private':'group')!==query.conversationKind)return false;
       if(actor.kind==='user'&&(s.authority!=='user'||s.roomId!==actor.roomId||(query.scope!=='room_users'&&s.ownerId!==actor.memberId)))return false;
       if(query.roomId&&query.roomId!==s.roomId||query.ownerId&&query.ownerId!==s.ownerId||query.authority&&query.authority!==s.authority||query.status&&query.status!==s.status)return false;
       if(!query.includeEnded&&!query.status&&(!activeStatuses.has(s.status)||s.archivedAt))return false;
@@ -80,7 +84,7 @@ export class ScheduledTaskService {
   private saveCommand(c:ScheduleCommand){this.db.prepare('INSERT INTO schedule_commands VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,schedule_id=excluded.schedule_id,data=excluded.data').run(c.id,c.idempotencyKey,c.status,c.mutation.op==='create'?c.receipt?.scheduleId??null:c.mutation.id,c.createdAt,JSON.stringify(c));}
   private existing(actor:ScheduleActor,key:string){const row=this.db.prepare('SELECT data FROM schedule_commands WHERE idempotency_key=?').get(this.key(actor,key));return row?decode<ScheduleCommand>(row):undefined;}
   private makeCommand(actor:ScheduleActor,mutation:ScheduleMutation,key:string,status:ScheduleCommand['status']):ScheduleCommand{return {id:'sc-'+randomUUID(),idempotencyKey:this.key(actor,key),actor:clone(actor),mutation:clone(mutation),policyVersion:this.readPolicy().version,status,createdAt:this.now(),updatedAt:this.now()};}
-  private assertDelivery(input:ScheduleInput,authority:'system'|'user'){if(input.deliveryMode==='local'&&(authority!=='system'||input.executionKind!=='worker'))throw new ScheduleError('INVALID_DELIVERY','仅系统 Worker 任务可只保存后台结果。');}
+  private assertDelivery(input:ScheduleInput,authority:'system'|'user'){if(isPrivateRoom(input.roomId)&&input.recipientIds?.length)throw new ScheduleError('INVALID_RECIPIENT','私聊不能指定额外收件人。');if(input.attachmentRefs?.length&&(input.executionKind!=='worker'||input.attachmentRefs.reduce((n,a)=>n+a.bytes,0)>20*1024**2))throw new ScheduleError('INVALID_ATTACHMENTS','文件只可绑定 Worker 计划且合计不超过 20 MiB。');if(input.deliveryMode==='local'&&(authority!=='system'||input.executionKind!=='worker'))throw new ScheduleError('INVALID_DELIVERY','仅系统 Worker 任务可只保存后台结果。');}
   private applyCreate(actor:ScheduleActor,value:ScheduleInput):Schedule{
     this.fresh(actor);const input=this.input(value);this.assertDelivery(input,actor.kind==='admin'?'system':'user');if(actor.kind==='user'&&input.roomId!==actor.roomId)throw new ScheduleError('FORBIDDEN','不能跨群登记任务。',403);
     const count=(sql:string,...args:(string|number)[])=>Number(this.db.prepare(sql).get(...args)?.n);
@@ -102,10 +106,12 @@ export class ScheduledTaskService {
   create(actor:ScheduleActor,input:ScheduleInput,key:string){return this.transaction(()=>{const existing=this.existing(actor,key);if(existing?.receipt)return this.get(actor,existing.receipt.scheduleId);if(existing)throw new ScheduleError('COMMAND_STATE','该操作尚未提交或已拒绝。',409);const c=this.makeCommand(actor,{op:'create',input},key,'applied'),s=this.applyCreate(actor,input);c.receipt={scheduleId:s.id,version:s.version};this.saveCommand(c);return s;});}
   update(actor:ScheduleActor,id:string,expectedVersion:number,patch:Partial<ScheduleInput>,key:string){return this.transaction(()=>{const existing=this.existing(actor,key);if(existing?.receipt)return this.get(actor,existing.receipt.scheduleId);if(existing)throw new ScheduleError('COMMAND_STATE','该操作尚未提交或已拒绝。',409);const c=this.makeCommand(actor,{op:'update',id,expectedVersion,patch},key,'applied'),s=this.applyUpdate(actor,id,expectedVersion,patch);c.receipt={scheduleId:s.id,version:s.version};this.saveCommand(c);return s;});}
   private runRows(id:string){return this.db.prepare('SELECT data FROM schedule_runs WHERE schedule_id=? ORDER BY rowid').all(id).map(row=>decode<ScheduleRun>(row));}
-  private outstanding(id:string){return this.runRows(id).filter(r=>['queued','running'].includes(r.status)||['pending','sending','unknown','deferred'].includes(r.deliveryStatus??''));}
+  private isOutstanding(r:ScheduleRun){return ['queued','running'].includes(r.status)||(this.deliveryOutstanding?.(r.id)??['pending','sending','unknown','deferred'].includes(r.deliveryStatus??''));}
+  private outstanding(id:string){return this.runRows(id).filter(r=>this.isOutstanding(r));}
   private cancelRuns(id:string,reason:string,queuedOnly=false){for(const r of this.runRows(id)){if(queuedOnly?r.status!=='queued':!this.outstanding(id).some(x=>x.id===r.id))continue;r.cancelRequestedAt=this.now();r.status='cancelled';r.reason=reason;r.finishedAt=this.now();if(r.deliveryStatus==='pending'||r.deliveryStatus==='deferred')r.deliveryStatus='stale';this.saveRun(r);}}
   private applyControl(actor:ScheduleActor,mutation:Exclude<ScheduleMutation,{op:'create'|'update'}>,command:ScheduleCommand){
     const s=this.raw(mutation.id);this.manage(actor,s);this.version(s.version,mutation.expectedVersion);const now=this.now();
+    if(mutation.op==='resume'||mutation.op==='run_now')this.validateExecution?.(s);
     if(mutation.op==='run_now'){
       if(s.status==='cancelled'||s.archivedAt||s.scheduleSpec.kind==='once'&&s.status==='completed'||s.maxRuns!==undefined&&s.triggerCount>=s.maxRuns||s.expiresAt!==undefined&&now>s.expiresAt)throw new ScheduleError('ENDED','已结束任务不能再次执行，请新建或修改规则。',409);this.permittedRoom(s.roomId);if(s.status==='blocked')throw new ScheduleError('BLOCKED','任务受阻，请先处理原因并恢复。',409);
       if(s.scheduleSpec.kind!=='once'&&(s.nextEligibleAt??0)>now)throw new ScheduleError('FREQUENCY_LIMIT','周期任务最多每小时执行一次。',409,{nextEligibleAt:s.nextEligibleAt});
@@ -119,7 +125,7 @@ export class ScheduledTaskService {
     if(mutation.op==='archive'){if(!['completed','cancelled'].includes(s.status))throw new ScheduleError('ACTIVE','请先取消尚未结束的计划。',409);s.archivedAt=now;}
     else if(mutation.op==='cancel'){s.status='cancelled';s.stateReason='cancelled';s.nextRunAt=null;s.generation++;this.cancelRuns(s.id,'plan_cancelled');this.rejectPlanCommands(s.id);}
     else if(mutation.op==='pause'){if(s.status==='cancelled')throw new ScheduleError('ENDED','已取消任务不能暂停。',409);s.status='paused';s.stateReason='manual';this.cancelRuns(s.id,'paused',true);}
-    else if(mutation.op==='resume'){if(s.status==='cancelled'||s.archivedAt)throw new ScheduleError('ENDED','已取消任务不能恢复。',409);this.permittedRoom(s.roomId);const next=nextOccurrence(s.scheduleSpec,s.timezone,now);if(next===null||s.expiresAt!==undefined&&next>s.expiresAt||s.maxRuns!==undefined&&s.triggerCount>=s.maxRuns)throw new ScheduleError('PAST_SCHEDULE','任务已结束，请先修改规则。');s.status='active';delete s.stateReason;s.nextRunAt=next;s.consecutiveFailures=0;}
+    else if(mutation.op==='resume'){if(this.outstanding(s.id).length)throw new ScheduleError('DELIVERY_UNRESOLVED','仍有执行或交付待处理，请先查询并结案。',409);if(s.status==='cancelled'||s.archivedAt)throw new ScheduleError('ENDED','已取消任务不能恢复。',409);this.permittedRoom(s.roomId);const next=nextOccurrence(s.scheduleSpec,s.timezone,now);if(next===null||s.expiresAt!==undefined&&next>s.expiresAt||s.maxRuns!==undefined&&s.triggerCount>=s.maxRuns)throw new ScheduleError('PAST_SCHEDULE','任务已结束，请先修改规则。');s.status='active';delete s.stateReason;s.nextRunAt=next;s.consecutiveFailures=0;}
     s.version++;this.save(s);command.receipt={scheduleId:s.id,version:s.version};this.audit(mutation.op,{id:s.id,actor});
   }
   command(actor:ScheduleActor,id:string,op:ScheduleCommandOp,expectedVersion:number,key:string,runId?:string):ScheduleCommand{return this.transaction(()=>{const old=this.existing(actor,key);if(old)return this.getCommand(actor,old.id);if(!['pause','resume','cancel','run_now','stop_run','archive'].includes(op))throw new ScheduleError('INVALID_OPERATION','任务操作无效。');const c=this.makeCommand(actor,{op,id,expectedVersion,...(runId?{runId}:{})},key,'applied');this.applyControl(actor,c.mutation as Exclude<ScheduleMutation,{op:'create'|'update'}>,c);this.saveCommand(c);return c;});}
@@ -154,9 +160,9 @@ export class ScheduledTaskService {
   private rejectPlanCommands(id:string){for(const row of this.db.prepare("SELECT data FROM schedule_commands WHERE schedule_id=? AND status IN ('pending','proposed')").all(id)){const c=decode<ScheduleCommand>(row);c.status='superseded';c.error='plan_cancelled';this.saveCommand(c);}}
   getRun(id:string):ScheduleRun|undefined{const row=this.db.prepare('SELECT data FROM schedule_runs WHERE id=?').get(id);return row?decode(row):undefined;}
   runForThread(id:string):ScheduleRun|undefined{const row=this.db.prepare('SELECT data FROM schedule_runs WHERE thread_id=?').get(id);return row?decode(row):undefined;}
-  activeRuns():ScheduleRun[]{return this.db.prepare("SELECT data FROM schedule_runs WHERE status IN ('queued','running') OR json_extract(data,'$.deliveryStatus') IN ('pending','sending','unknown','deferred')").all().map(row=>decode(row));}
+  activeRuns():ScheduleRun[]{return this.db.prepare("SELECT data FROM schedule_runs WHERE status IN ('queued','running') OR json_extract(data,'$.deliveryStatus') IN ('pending','sending','unknown','deferred')").all().map(row=>decode<ScheduleRun>(row)).filter(r=>this.isOutstanding(r));}
   private saveRun(r:ScheduleRun){this.db.prepare('INSERT INTO schedule_runs VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,thread_id=excluded.thread_id,data=excluded.data').run(r.id,r.scheduleId,r.triggerKey,r.status,r.threadId??null,r.createdAt,JSON.stringify(r));}
-  private newRun(s:Schedule,at:number,trigger:'automatic'|'manual',key:string):ScheduleRun{const old=this.db.prepare('SELECT data FROM schedule_runs WHERE trigger_key=?').get(key);if(old)return decode(old);return {id:'sr-'+randomUUID(),scheduleId:s.id,scheduleVersion:s.version,generation:s.generation,triggerKey:key,trigger,scheduledAt:at,createdAt:this.now(),status:'queued',snapshot:clone(s)};}
+  private newRun(s:Schedule,at:number,trigger:'automatic'|'manual',key:string):ScheduleRun{const old=this.db.prepare('SELECT data FROM schedule_runs WHERE trigger_key=?').get(key);if(old)return decode(old);return {id:'sr-'+randomUUID(),scheduleId:s.id,scheduleVersion:s.version,generation:s.generation,triggerKey:key,trigger,scheduledAt:at,createdAt:this.now(),status:'queued',deliveryExpiresAt:Math.min(at+s.catchUpWindowMs,s.expiresAt??Infinity),snapshot:clone(s)};}
   isRunValid(id:string){const run=this.getRun(id);if(!run||run.cancelRequestedAt||run.status==='cancelled'||run.status==='skipped')return false;const s=this.raw(run.scheduleId);if(s.status==='cancelled'||s.generation!==run.generation)return false;if(run.startedAt===undefined&&run.trigger!=='manual'&&(s.status!=='active'&&s.status!=='completed'||s.version!==run.scheduleVersion))return false;return true;}
   canPublish(id:string){return this.isRunValid(id);}
   startRun(id:string):boolean{return this.transaction(()=>{const r=this.getRun(id);if(!r||!['queued','running'].includes(r.status)||!this.isRunValid(id))return false;const s=this.raw(r.scheduleId),now=this.now();if(r.startedAt!==undefined){r.status='running';this.saveRun(r);return true;}
@@ -167,7 +173,7 @@ export class ScheduledTaskService {
     const ids=this.db.prepare("SELECT id FROM schedules WHERE status='active' AND next_run_at<=? ORDER BY next_run_at LIMIT ?").all(now,limit).map(x=>String(x.id)),result:ScheduleRun[]=[];
     for(const id of ids)this.transaction(()=>{const s=this.raw(id);if(s.status!=='active'||s.nextRunAt===null||s.nextRunAt>now)return;
       const due=s.nextRunAt,key=`auto:${s.id}:${s.version}:${due}`,r=this.newRun(s,due,'automatic',key);if(this.getRun(r.id))return;
-      let reason:string|undefined;const allowed=!this.options.allowedRoomIds||this.options.allowedRoomIds.includes(s.roomId);
+      let reason:string|undefined;const allowed=this.options.canAccessRoom?this.options.canAccessRoom(s.roomId):!this.options.allowedRoomIds||this.options.allowedRoomIds.includes(s.roomId);
       if(!allowed){s.status='blocked';s.stateReason='room_not_allowed';this.save(s);return;}
       if(s.expiresAt!==undefined&&now>s.expiresAt||s.maxRuns!==undefined&&s.triggerCount>=s.maxRuns)reason='ended';
       else if(now-due>s.catchUpWindowMs||s.misfirePolicy==='skip'&&now-due>60_000)reason='missed';
@@ -180,7 +186,7 @@ export class ScheduledTaskService {
     try{this.transaction(()=>{if((c.expiresAt??0)<now)throw new ScheduleError('COMMAND_EXPIRED','立即执行请求已过期。');const s=this.raw(mutation.id);this.manage(c.actor,s);this.version(s.version,mutation.expectedVersion);if(s.status==='blocked')throw new ScheduleError('BLOCKED','任务受阻，请先处理原因并恢复。',409);if(s.status==='cancelled'||s.archivedAt||s.scheduleSpec.kind==='once'&&s.status==='completed'||s.maxRuns!==undefined&&s.triggerCount>=s.maxRuns||s.expiresAt!==undefined&&now>s.expiresAt)throw new ScheduleError('ENDED','计划已结束。');if(this.outstanding(s.id).length)throw new ScheduleError('OVERLAP','已有执行。');if(s.scheduleSpec.kind!=='once'&&(s.nextEligibleAt??0)>now)throw new ScheduleError('FREQUENCY_LIMIT','周期任务最多每小时执行一次。');const run=this.newRun(s,now,'manual','manual:'+c.id);s.triggerCount++;if(s.scheduleSpec.kind==='once'||s.maxRuns!==undefined&&s.triggerCount>=s.maxRuns){s.status='completed';s.nextRunAt=null;}this.save(s);this.materialize(run,s,materialize);c.status='applied';c.receipt={scheduleId:s.id,version:s.version,runId:run.id};});}
     catch(error){c.status='rejected';c.error=error instanceof ScheduleError?error.code:String(error);}c.updatedAt=now;this.saveCommand(c);result.push(c);});return result;}
   finishRun(id:string,status:Extract<ScheduleRunStatus,'succeeded'|'failed'|'needs_input'>,data:{resultId?:string;outboxId?:string;error?:string}={}):boolean{return this.transaction(()=>{if(!this.isRunValid(id))return false;const r=this.getRun(id)!;if(['succeeded','failed','needs_input'].includes(r.status)){Object.assign(r,data);if((data.resultId||data.outboxId)&&!r.deliveryStatus)r.deliveryStatus='pending';this.saveRun(r);return true;}r.status=status;r.finishedAt=this.now();Object.assign(r,data);if(data.resultId||data.outboxId)r.deliveryStatus='pending';this.saveRun(r);const s=this.raw(r.scheduleId);if(status==='failed'){s.consecutiveFailures++;if(s.consecutiveFailures>=this.options.failureThreshold){s.status='paused';s.stateReason='consecutive_failures';}}else if(status==='needs_input'){s.status='paused';s.stateReason='needs_input';}else s.consecutiveFailures=0;this.save(s);return true;});}
-  recordDelivery(id:string,status:string){this.transaction(()=>{const r=this.getRun(id);if(!r)return;r.deliveryStatus=status;this.saveRun(r);if(status==='unknown'){const s=this.raw(r.scheduleId);if(s.status!=='cancelled'){s.status='blocked';s.stateReason='delivery_unknown';this.save(s);}}});}
+  recordDelivery(id:string,status:string){this.transaction(()=>{const r=this.getRun(id);if(!r)return;r.deliveryStatus=status;this.saveRun(r);if(status==='unknown'&&this.isOutstanding(r)){const s=this.raw(r.scheduleId);if(s.status!=='cancelled'){s.status='blocked';s.stateReason='delivery_unknown';this.save(s);}}});}
   /** A local result has no platform delivery. Call only in the transaction that
    * stores its result, or after verifying that exact stored result on recovery. */
   completeLocalResult(id:string,resultId:string):boolean{return this.transaction(()=>{
@@ -192,7 +198,25 @@ export class ScheduledTaskService {
     return true;
   });}
   attachRun(id:string,refs:{threadId?:string;outboxId?:string;resultId?:string}){this.transaction(()=>{const r=this.getRun(id);if(!r)throw new ScheduleError('RUN_NOT_FOUND','执行不存在。',404);Object.assign(r,refs);if(refs.outboxId)r.deliveryStatus='pending';this.saveRun(r);});}
-  recover(){this.transaction(()=>{for(const r of this.activeRuns()){if(!this.isRunValid(r.id)){r.status='cancelled';r.reason='recovery_invalid';r.finishedAt=this.now();}else if(r.status==='running')r.status='queued';if(r.deliveryStatus==='sending')r.deliveryStatus='unknown';this.saveRun(r);if(r.deliveryStatus==='unknown'){const s=this.raw(r.scheduleId);if(s.status!=='cancelled'){s.status='blocked';s.stateReason='delivery_unknown';this.save(s);}}}});}
+  recover(){this.transaction(()=>{for(const r of this.activeRuns()){if(!this.isRunValid(r.id)){r.status='cancelled';r.reason='recovery_invalid';r.finishedAt=this.now();}else if(r.status==='running')r.status='queued';if(r.deliveryStatus==='sending')r.deliveryStatus='unknown';this.saveRun(r);if(r.deliveryStatus==='unknown'&&this.isOutstanding(r)){const s=this.raw(r.scheduleId);if(s.status!=='cancelled'){s.status='blocked';s.stateReason='delivery_unknown';this.save(s);}}}});}
   block(id:string,reason:string,options:{cancelRunning?:boolean}={}){this.transaction(()=>{const s=this.raw(id);if(s.status==='cancelled')return;s.status='blocked';s.stateReason=reason;if(options.cancelRunning){s.generation++;this.cancelRuns(id,reason);}else this.cancelRuns(id,reason,true);this.save(s);});}
+  resolveDeliveryBlock(runId:string){this.transaction(()=>{
+    const run=this.getRun(runId);if(!run)return;const s=this.raw(run.scheduleId);
+    if(s.status!=='blocked'||s.stateReason!=='delivery_unknown'||this.outstanding(s.id).length)return;
+    const next=nextOccurrence(s.scheduleSpec,s.timezone,this.now());
+    const ended=s.archivedAt||s.maxRuns!==undefined&&s.triggerCount>=s.maxRuns||next===null||s.expiresAt!==undefined&&next>s.expiresAt;
+    s.status=ended?'completed':'paused';s.stateReason='delivery_resolved';s.nextRunAt=ended?null:next;s.version++;this.save(s);this.audit('delivery_resolved',{id:s.id,runId});
+  });}
+  revokeRoom(roomId:string){this.transaction(()=>{
+    for(const row of this.db.prepare('SELECT data FROM schedules WHERE room_id=?').all(roomId)){
+      const s=decode<Schedule>(row);if(['active','paused','blocked'].includes(s.status)){
+        s.status='blocked';s.stateReason='private_access_denied';s.generation++;this.cancelRuns(s.id,'private_access_denied');this.save(s);
+      }else this.cancelRuns(s.id,'private_access_denied');
+    }
+    for(const row of this.db.prepare("SELECT data FROM schedule_commands WHERE status IN ('pending','proposed')").all()){
+      const c=decode<ScheduleCommand>(row);
+      if(c.actor.kind==='user'&&c.actor.roomId===roomId||c.mutation.op==='create'&&c.mutation.input.roomId===roomId||c.mutation.op!=='create'&&this.raw(c.mutation.id).roomId===roomId){c.status='superseded';c.error='private_access_denied';this.saveCommand(c);}
+    }
+  });}
   disable(){this.transaction(()=>{for(const row of this.db.prepare("SELECT data FROM schedules WHERE status IN ('active','blocked','paused','completed')").all()){const s=decode<Schedule>(row);if(s.status==='paused'&&s.stateReason==='feature_disabled'&&!this.outstanding(s.id).length)continue;if(s.status==='completed'&&!this.outstanding(s.id).length)continue;s.status='paused';s.stateReason='feature_disabled';s.generation++;this.cancelRuns(s.id,'feature_disabled');this.rejectPlanCommands(s.id);this.save(s);}});}
 }

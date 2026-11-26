@@ -48,7 +48,7 @@ const json=<T>(value:T):T=>JSON.parse(JSON.stringify(value));
 function clip(text:string,limit:number){return {text:text.slice(0,limit),...(text.length>limit?{textTruncated:true,totalCharacters:text.length}:{})};}
 function projectMessage(message:GroupMessage,limit:number) {
   return {...message,...clip(message.text,limit),mentions:message.mentions.slice(0,12),
-    attachments:message.attachments.map((attachment,attachmentIndex)=>({kind:attachment.kind,hasImage:true,attachmentIndex}))};
+    attachments:message.attachments.map((attachment,attachmentIndex)=>({kind:attachment.kind,hasImage:attachment.kind==='image',attachmentIndex,...(attachment.kind==='file'?{attachmentId:attachment.attachmentId,name:attachment.name,bytes:attachment.bytes,downloadError:attachment.downloadError}:{})}))};
 }
 /** Stable host projection: preserve attribution, never expose attachment locators. */
 export function projectWorkerInput(input:ThreadInput,limit=Number.MAX_SAFE_INTEGER) {

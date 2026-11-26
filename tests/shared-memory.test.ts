@@ -454,3 +454,9 @@ describe('configured member field registry', () => {
     expect(()=>service.fieldDefinitions('room')).toThrow('unregistered');
   });
 });
+
+it('stops a revoked member write after a delayed directory response',async()=>{
+ const {service,http,client}=setup(),intent=await prepare(service),controller=new AbortController();
+ client.ensureMemberDirectory=async()=>{controller.abort();};
+ await expect(service.applyMemberWrite(intent,controller.signal)).rejects.toThrow();expect(http.writes).toHaveLength(0);
+});

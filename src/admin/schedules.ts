@@ -1,3 +1,7 @@
+import {PrivateChatAccess} from '../private-chat.js';
+import {DeliveryService} from '../delivery-resolution.js';
+import {AttachmentService} from '../attachments.js';
+import {isPrivateRoom} from '../conversation.js';
 import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
@@ -24,7 +28,20 @@ function key(input:Record<string,unknown>):string{
   return 'admin:'+input.idempotencyKey;
 }
 function only(input:Record<string,unknown>,keys:string[]){if(Object.keys(input).some(k=>!keys.includes(k)))throw new ScheduleError('INVALID_REQUEST','请求包含不支持的字段。');}
-const inputFields=['deliveryMode','roomId','title','executionKind','content','recipientIds','scheduleSpec','timezone','misfirePolicy','expiresAt','maxRuns','catchUpWindowMs','timeoutMs','requiredCapabilityIds','businessProfileId'];
+const inputFields=['deliveryMode','roomId','title','executionKind','content','recipientIds','scheduleSpec','timezone','misfirePolicy','expiresAt','maxRuns','catchUpWindowMs','timeoutMs','requiredCapabilityIds','businessProfileId','attachmentIds'];
+function fileSelection(store:Store,config:Config,input:Record<string,unknown>,roomId:string){
+  const {attachmentIds,...rest}=input;if(attachmentIds===undefined)return rest;
+  if(!Array.isArray(attachmentIds)||attachmentIds.length>4||new Set(attachmentIds).size!==attachmentIds.length||attachmentIds.some(id=>typeof id!=='string'))throw new ScheduleError('INVALID_ATTACHMENTS','最多选择四个附件。');
+  if(attachmentIds.length&&!isPrivateRoom(roomId))throw new ScheduleError('INVALID_ATTACHMENTS','文件绑定仅支持私聊。');
+  const messages=store.db.prepare('SELECT data FROM messages WHERE room=?').all(roomId).map(row=>JSON.parse(String(row.data)));
+  const refs=attachmentIds.map(id=>{
+    const source=messages.find(m=>m.attachments.some((a:any)=>a.attachmentId===id)),file=source?.attachments.find((a:any)=>a.attachmentId===id);
+    if(!file?.sha256||!file.bytes)throw new ScheduleError('ATTACHMENT_UNAVAILABLE','文件尚未下载或已不可用，请在原会话重新上传并选择。');
+    return {attachmentId:id,sourceInputId:source.id,name:file.name,bytes:file.bytes,sha256:file.sha256};
+  });
+  if(refs.length)new AttachmentService(config,store).validateCachedRefs(roomId,refs);
+  return {...rest,attachmentRefs:refs};
+}
 function normalizedSpec(value:unknown,timezone:string):ScheduleSpec{
   const spec={...object(value)};
   const field=spec.kind==='once'?'at':spec.kind==='interval'?'anchorAt':undefined;
@@ -52,8 +69,15 @@ export class AdminSchedulesApi {
     // host schema and its version guard, without starting runtime recovery.
     const store=new Store(join(this.config.stateDir,'state.sqlite')),db=store.db;
     try{
-      const roomIds=this.config.qq.allowedGroupIds.map(id=>`qq:${this.config.qq.selfId}:${id}`);
+      const applied=db.prepare("SELECT data FROM telemetry WHERE kind='private_config_applied' ORDER BY id DESC LIMIT 1").get();
+      const access=new PrivateChatAccess(this.config.qq.selfId,applied?JSON.parse(String(applied.data)).settings:this.config.qq.privateChat);
+      const roomIds=[...this.config.qq.allowedGroupIds.map(id=>`qq:${this.config.qq.selfId}:${id}`),...access.rooms()];
       const service=new ScheduledTaskService(db,{...this.config.scheduledTasks,allowedRoomIds:roomIds});
+      const deliveries=new DeliveryService(store,service,join(this.config.stateDir,'workspaces'));service.deliveryOutstanding=id=>deliveries.outstanding(id);
+      service.validateExecution=schedule=>{
+        if(isPrivateRoom(schedule.roomId)&&!access.allows(schedule.roomId))throw new ScheduleError('FORBIDDEN','private_access_denied',403);
+        if(schedule.attachmentRefs?.length)new AttachmentService(this.config,store).validateCachedRefs(schedule.roomId,schedule.attachmentRefs);
+      };
       const running=scheduleServiceOnline(this.config),enabled=this.config.scheduledTasks?.enabled===true;
       const metadata={running,enabled,allowedRoomIds:roomIds,defaultTimezone:this.config.scheduledTasks?.defaultTimezone??'Asia/Shanghai',minIntervalMs:Math.max(3_600_000,this.config.scheduledTasks?.minIntervalMs??0)};
       const path=url.pathname;
@@ -64,6 +88,7 @@ export class AdminSchedulesApi {
       if(method==='GET'&&path==='/api/schedules'){
         const params=url.searchParams,query:ScheduleQuery={offset:integer(params.get('offset')??'0','偏移量'),limit:integer(params.get('limit')??'50','每页数量',1,100),includeEnded:params.get('includeEnded')==='true'};
         for(const field of ['roomId','ownerId','authority','status','q'] as const){const value=params.get(field)??(field==='roomId'?params.get('room'):null);if(value)(query as Record<string,unknown>)[field]=value;}
+        const kind=params.get('kind');if(kind==='private'||kind==='group')query.conversationKind=kind;
         const page=service.list(admin,query);
         return {status:200,value:{...page,items:page.items.map(schedule=>({...schedule,lastRun:service.runs(admin,schedule.id,{limit:1}).items[0]??null})),...metadata,available:true}};
       }
@@ -74,7 +99,7 @@ export class AdminSchedulesApi {
       }
       if(method==='POST'&&path==='/api/schedules'){
         const body=object(input);only(body,['input','idempotencyKey']);const draft=object(body.input);only(draft,inputFields);
-        const normalized={...normalizedInput(draft,metadata.defaultTimezone),businessProfileId:resolveBusinessProfile(reloadAgentConfig(this.config).config,typeof draft.roomId==='string'?draft.roomId:'').id};
+        const normalized={...normalizedInput(fileSelection(store,this.config,draft,String(draft.roomId)),metadata.defaultTimezone),businessProfileId:resolveBusinessProfile(reloadAgentConfig(this.config).config,typeof draft.roomId==='string'?draft.roomId:'').id};
         return {status:201,value:{schedule:service.create(admin,normalized as unknown as ScheduleInput,key(body)),...metadata,message:!enabled?'已保存；定时任务功能尚未启用。':!running?'已保存，等待机器人服务启动。':'已保存，等待计划时间执行。'}};
       }
       const commandMatch=/^\/api\/schedule-commands\/([^/]+)$/.exec(path);
@@ -95,7 +120,7 @@ export class AdminSchedulesApi {
           const usage=hasUsage?readThreadTokenUsage(db,result.items.flatMap(run=>run.threadId?[run.threadId]:[])):new Map();
           return {status:200,value:{...result,items:result.items.map(run=>({...run,result:hasResults&&run.resultId?(()=>{const row=db.prepare('SELECT data FROM results WHERE id=?').get(run.resultId);return row?JSON.parse(String(row.data)):undefined;})():undefined,tokenUsage:run.threadId?usage.get(run.threadId):undefined,outbox:hasOutbox?db.prepare("SELECT id,status,data FROM outbox WHERE (? IS NOT NULL AND id=?) OR json_extract(data,'$.scheduleRunId')=? ORDER BY rowid DESC LIMIT 10").all(run.outboxId??null,run.outboxId??null,run.id).map(row=>({...row,data:JSON.parse(String(row.data))})):[]}))}};
         }
-        if(method==='POST'&&action==='update'){const body=object(input);only(body,['expectedVersion','patch','idempotencyKey']);const patch=object(body.patch);only(patch,inputFields);const timezone=service.get(admin,id).timezone;return {status:200,value:{schedule:service.update(admin,id,integer(body.expectedVersion,'版本',1),normalizedInput(patch,timezone),key(body)),...metadata}};}
+        if(method==='POST'&&action==='update'){const body=object(input);only(body,['expectedVersion','patch','idempotencyKey']);const patch=object(body.patch);only(patch,inputFields);const timezone=service.get(admin,id).timezone;return {status:200,value:{schedule:service.update(admin,id,integer(body.expectedVersion,'版本',1),normalizedInput(fileSelection(store,this.config,patch,service.get(admin,id).roomId),timezone),key(body)),...metadata}};}
         if(method==='POST'&&action==='commands'){
           const body=object(input);only(body,['expectedVersion','op','runId','idempotencyKey']);
           if(!['pause','resume','cancel','run_now','stop_run','archive'].includes(String(body.op)))throw new ScheduleError('INVALID_REQUEST','不支持的任务操作。');
