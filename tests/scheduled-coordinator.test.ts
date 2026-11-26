@@ -143,6 +143,25 @@ function manage(runtime: TaskRuntime, operation: ScheduleModelMutation) {
 }
 
 describe('scheduled execution through the Coordinator', () => {
+  it('changes a fixed reminder into generated content and mentions the addressed member',async()=>{
+    const f=fixture();
+    manage(f.runtime,modelCreate({executionKind:'reminder',content:'A short fixed story.',scheduleSpec:{kind:'cron',expression:'0 23 * * *'},timezone:'Asia/Shanghai'}));
+    await f.coordinator.receive(message('create'));await f.coordinator.drain();
+    const before=f.service.list(ADMIN).items[0];
+    expect(f.publisher.messages.some(m=>m.message.text.includes('执行方式：按原文发送'))).toBe(true);
+    manage(f.runtime,{op:'update',id:before.id,expectedVersion:before.version,patch:{executionKind:'worker',content:'Compose a vivid bedtime story with a beginning, turn and ending.',recipientIds:['301']}});
+    await f.coordinator.receive(message('edit'));await f.coordinator.drain();
+    const updated=f.service.get(ADMIN,before.id);
+    expect(updated).toMatchObject({executionKind:'worker',recipientIds:['301'],scheduleSpec:before.scheduleSpec,timezone:before.timezone});
+    expect(f.publisher.messages.some(m=>m.message.text.includes('执行方式：届时生成或处理内容'))).toBe(true);
+    f.advance(updated.nextRunAt!-Date.now());await f.coordinator.tick();
+    expect(f.runtime.workers[0].scheduledInput).toMatchObject({instructions:updated.content,recipientIds:['301']});
+    expect(scheduleSends(f)).toHaveLength(0);
+    await finish(f,0,{shortAnswer:'The traveler found a lantern beneath the old bridge. Its warm light led her home. Good night.'});
+    expect(scheduleSends(f)).toHaveLength(1);
+    expect(scheduleSends(f)[0].message).toMatchObject({recipientIds:['301'],text:expect.stringContaining('The traveler found a lantern')});
+    expect(scheduleSends(f)[0].message.text).not.toContain(updated.content);
+  });
   it('carries Router-registered recipients through restart into reminder delivery', async()=>{
     const f=fixture();manage(f.runtime,modelCreate({executionKind:'reminder',content:'Remember the meeting.',recipientIds:['302','303','302']}));
     await f.coordinator.receive(message('recipient-request'));

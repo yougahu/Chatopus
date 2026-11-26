@@ -91,7 +91,7 @@ export class ScheduledTaskHost {
     const id=result.receipt?.scheduleId??result.id??'';
     const schedule=id?this.service.get(admin,id):undefined;
     const next=schedule?.nextRunAt?new Intl.DateTimeFormat('zh-CN',{timeZone:schedule.timezone,dateStyle:'medium',timeStyle:'short'}).format(schedule.nextRunAt)+'（'+schedule.timezone+'）':undefined;
-    return `${schedule?.title??'任务'}：${({active:'已登记',paused:'已暂停',blocked:'暂不可执行',completed:'已完成',cancelled:'已取消'} as Record<string,string>)[schedule?.status??'']??'操作已保存'}。${next?'下次执行：'+next+'。':''}${schedule?.recipientIds?.length?'收件人：'+schedule.recipientIds.join('、')+'。':''}${result.status==='pending'?'操作已排队，等待服务执行。':''}`;
+    return `${schedule?.title??'任务'}：${({active:'已登记',paused:'已暂停',blocked:'暂不可执行',completed:'已完成',cancelled:'已取消'} as Record<string,string>)[schedule?.status??'']??'操作已保存'}。${schedule?'执行方式：'+(schedule.executionKind==='worker'?'届时生成或处理内容':'按原文发送')+'。':''}${next?'下次执行：'+next+'。':''}${schedule?.recipientIds?.length?'收件人：'+schedule.recipientIds.join('、')+'。':''}${result.status==='pending'?'操作已排队，等待服务执行。':''}`;
   }
   private source(thread:StoredThread){
     // Another participant's latest request cannot borrow the owner's older
