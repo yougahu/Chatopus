@@ -23,9 +23,13 @@
 | 文档 | 内容 |
 | --- | --- |
 | [架构](architecture.md) | Router、Worker、任务状态与能力边界 |
+| [QQ 私聊接入设计](private-chat-design.md) | 首版设计草案：好友私聊、文件收发、个人定时任务、配置热更新与临时会话拒绝 |
 | [原生运行时](runtime.md) | dsh 装配、模型调用与可信插件 |
 | [Router 上下文](router-context.md) | 持续会话、召回、预算与恢复 |
 | [验证方法](verification.md) | 离线检查、干净安装和可选集成测试 |
 | [发布](releasing.md) | 源码导出、依赖、私有数据与托管配置 |
 
 贡献约定见 [CONTRIBUTING](../CONTRIBUTING.md)，安全边界见 [SECURITY](../SECURITY.md)，职责约束见 [AGENTS](../AGENTS.md)。
+
+- [QQ 私聊使用说明](private-chat.md)
+- [私聊实现核对与联调](private-chat-verification.md)

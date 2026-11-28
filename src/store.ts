@@ -1,3 +1,5 @@
+import {isPrivateRoom} from './conversation.js';
+import type {PrivateChatAccess} from './private-chat.js';
 import {handoffRecord} from './task-handoff.js';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
@@ -16,7 +18,11 @@ export interface FileDelivery {
   artifactId:string;status:'pending'|'sending'|'sent'|'failed'|'unknown';attempts:number;
   platformFileId?:string;reason?:string;sentAt?:number;attemptId?:string;
 }
-export interface OutboxRow { scheduleRunId?:string; hostLinks?:import('./tools/reply-links.js').ReplyLink[]; hostLinkTemplate?:string; id: string; message: OutgoingMessage; threadId?: string; associationThreadId?: string; revision?: number; epoch?: number; resultId?: string; kind?: 'acknowledgement'|'handoff'|'immediate';deliveryAttemptId?:string; status: string; attempts: number; dueAt: number; platformMessageId?: string; sentAt?: number; reason?: string;fileDeliveries?:FileDelivery[];fileDeliveryNoticeFor?:string }
+export interface OutboxRow {
+  messageDelivery?:{status:string;reason?:string;platformMessageId?:string};
+  deliveryResolutions?:import('./delivery-resolution.js').DeliveryResolution[];resolutionVersion?:number;
+  resendOf?:string;resendParts?:Record<string,string>;resendActor?:import('./delivery-resolution.js').DeliveryActor;resendRequestKey?:string;independentResend?:boolean;invalidatedParts?:string[];
+  deliveryExpiresAt?:number; scheduleRunId?:string; hostLinks?:import('./tools/reply-links.js').ReplyLink[]; hostLinkTemplate?:string; id: string; message: OutgoingMessage; threadId?: string; associationThreadId?: string; revision?: number; epoch?: number; resultId?: string; kind?: 'acknowledgement'|'handoff'|'immediate';deliveryAttemptId?:string; status: string; attempts: number; dueAt: number; platformMessageId?: string; sentAt?: number; reason?: string;fileDeliveries?:FileDelivery[];fileDeliveryNoticeFor?:string }
 export interface ReferenceResolution {
   status:'none'|'resolved'|'unbound'|'missing'|'ambiguous'|'cycle'|'depth_limit';
   threadId?:string;
@@ -30,6 +36,7 @@ export type BindingResult='bound'|'existing'|'conflict';
 const decode = <T>(row: unknown): T => JSON.parse((row as {data:string}).data);
 
 export class Store {
+  privateAccess?:PrivateChatAccess;
   readonly db: DatabaseSync;
   readonly roomMemory: RoomMemoryStore;
   readonly routerSessions: RouterSessionStore;
@@ -37,7 +44,7 @@ export class Store {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     const schemaVersion=Number(this.db.prepare('PRAGMA user_version').get()?.user_version??0);
-    if(schemaVersion>2){this.db.close();throw new Error('Database schema is newer than this application; use the matching release');}
+    if(schemaVersion>3){this.db.close();throw new Error('Database schema is newer than this application; use the matching release');}
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,room TEXT NOT NULL,at INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,received_at INTEGER);
       CREATE INDEX IF NOT EXISTS messages_room ON messages(room,at);
@@ -55,6 +62,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS outbox_platform_id ON outbox(room,status,json_extract(data,'$.platformMessageId'));
       CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS telemetry(id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,at INTEGER NOT NULL,data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS telemetry_kind ON telemetry(kind,id);
+      CREATE INDEX IF NOT EXISTS telemetry_worker_thread ON telemetry(json_extract(data,'$.threadId')) WHERE kind='model' AND json_extract(data,'$.role')='worker';
       CREATE INDEX IF NOT EXISTS telemetry_delivery_outbox ON telemetry(json_extract(data,'$.outboxId'),id) WHERE kind IN ('delivery_attempt_started','delivery_attempt_settled');
       CREATE UNIQUE INDEX IF NOT EXISTS telemetry_event_id ON telemetry(kind,json_extract(data,'$.eventId')) WHERE json_type(data,'$.eventId')='text';
       `);
@@ -62,7 +71,7 @@ export class Store {
       this.db.exec('ALTER TABLE messages ADD COLUMN received_at INTEGER');
     this.roomMemory=new RoomMemoryStore(this);
     this.routerSessions=new RouterSessionStore(this.db);
-    if(schemaVersion<2)this.db.exec('PRAGMA user_version=2');
+    if(schemaVersion<3)this.db.exec('PRAGMA user_version=3');
   }
   transaction<T>(fn:()=>T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -292,6 +301,18 @@ export class Store {
   saveResult(result:ResultRow) { this.db.prepare('INSERT INTO results VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,due=excluded.due,data=excluded.data').run(result.id,result.threadId,result.status,result.dueAt,JSON.stringify(result)); }
   results(status='pending'):ResultRow[] { return this.db.prepare('SELECT data FROM results WHERE status=? ORDER BY due').all(status).map(x=>decode(x)); }
   enqueue(message:OutgoingMessage,meta:Partial<OutboxRow>={}):string {
+    if(isPrivateRoom(message.roomId)){
+      if(!this.privateAccess?.allows(message.roomId))throw new Error('private_access_denied');
+      if(message.recipientIds?.length)throw new Error('Private replies cannot mention recipients');
+      message={...message,quoteReply:message.quoteReply??this.privateAccess.snapshot.replyMode==='quote'};
+      const source=message.replyToMessageId?this.db.prepare("SELECT id FROM messages WHERE room=? AND json_extract(data,'$.messageId')=?").get(message.roomId,message.replyToMessageId):undefined;
+      if(source)message.sourceInputId??=String(source.id);
+      if(!message.sourceInputId&&meta.threadId)message.sourceInputId=this.inputs(meta.threadId).at(-1)?.message.id;
+    }
+    if(meta.scheduleRunId&&meta.deliveryExpiresAt===undefined){
+      const run=this.db.prepare('SELECT data FROM schedule_runs WHERE id=?').get(meta.scheduleRunId);
+      if(run)meta={...meta,deliveryExpiresAt:JSON.parse(String(run.data)).deliveryExpiresAt};
+    }
     const row:OutboxRow={id:meta.id??randomUUID(),message,status:'pending',attempts:0,dueAt:Date.now(),...meta};
     roomMemoryAtomic(this.db,()=>{
       const inserted=this.db.prepare('INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?)').run(row.id,message.roomId,row.status,row.dueAt,JSON.stringify(row));
@@ -349,11 +370,28 @@ export class Store {
       }
       // A process may die after platform accepted a send. Never blindly repeat it.
       for(const row of this.outbox('sending')){
+        if(row.messageDelivery?.status==='sending')row.messageDelivery={status:'unknown',reason:'interrupted_delivery'};
         row.status='unknown';row.reason='interrupted_delivery';this.deliveryAttempt(row,'settled',{status:'unknown',reason:row.reason});
         for(const file of row.fileDeliveries??[])if(file.status==='sending'){file.status='unknown';file.reason='interrupted_delivery';this.deliveryAttempt(row,'settled',{status:'unknown',reason:file.reason},file.artifactId,file.attemptId,file.attempts);}
         this.saveOutbox(row);
       }
     });
+  }
+  /** Called inside the policy application transaction; actual in-flight receipts remain facts. */
+  revokePrivateRoom(roomId:string){
+    const reason='private_access_denied';
+    this.db.prepare("UPDATE messages SET status='failed' WHERE room=? AND status IN ('pending','processing')").run(roomId);
+    for(const turn of this.routerSessions.pendingTurns(roomId))this.routerSessions.failTurn({turnId:turn.id,generation:turn.generation,error:{code:reason}});
+    this.db.prepare("UPDATE router_sessions SET generation=generation+1,inflight_turn_id=NULL,needs_rebuild=1,rebuild_reason=? WHERE room=?").run(reason,roomId);
+    for(const thread of [...this.threadsInStatus('queued'),...this.threadsInStatus('running')].filter(t=>t.roomId===roomId)){
+      if(thread.activeRunId){
+        const run=this.db.prepare('SELECT data FROM runs WHERE id=?').get(thread.activeRunId);
+        this.saveRun(thread.activeRunId,thread.id,'interrupted',{...(run?JSON.parse(String(run.data)):{}),endedAt:Date.now(),code:reason});
+      }
+      thread.status='cancelled';thread.epoch++;thread.activeRunId=undefined;this.saveThread(thread);
+    }
+    for(const result of this.results())if(result.roomId===roomId){result.status='stale';this.saveResult(result);}
+    for(const row of this.outbox('pending'))if(row.message.roomId===roomId){row.status='stale';row.reason=reason;this.saveOutbox(row);}
   }
   close(){this.db.close();}
 }

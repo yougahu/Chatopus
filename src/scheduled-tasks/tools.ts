@@ -15,6 +15,7 @@ const scheduleInputSchema=z.object({title:z.string().trim().min(1).max(200),
   expiresAt:z.number().int().nonnegative().optional(),maxRuns:z.number().int().min(1).max(100_000).optional(),
   catchUpWindowMs:z.number().int().nonnegative().max(30*24*3_600_000).optional(),timeoutMs:z.number().int().min(1000).max(24*3_600_000).optional(),
   requiredCapabilityIds:z.array(z.string().min(1).max(150)).max(30).optional(),businessProfileId:z.string().min(1).max(150).optional(),
+  attachmentIds:z.array(z.string().min(1).max(100)).max(4).optional(),
 }).strict();
 /** Model mutations deliberately have no identity, room or policy fields. */
 const scheduleWorkerMutationSchema=z.discriminatedUnion('op',[

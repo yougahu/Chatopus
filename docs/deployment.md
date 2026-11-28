@@ -629,3 +629,7 @@ sudo systemctl start chatopus-serve chatopus-admin
 - [`SECURITY.md`](../SECURITY.md)：安全边界和敏感信息处理。
 - [`docs/verification.md`](verification.md)：验证、回放和发布前检查。
 - [`docs/releasing.md`](releasing.md)：发布前清单和版本流程。
+
+## 私聊上线
+
+私聊默认关闭；空群列表与零目标启动均可用。启用前请先阅读 [私聊配置](private-chat.md) 和 [部署联调清单](private-chat-verification.md)。升级数据库版本 3 前一致性备份数据库、WAL、配置与受管附件。撤权通过热更新生效，二进制降级必须恢复匹配的升级前备份。

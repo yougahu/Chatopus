@@ -1,3 +1,6 @@
+import type {AttachmentService,AttachmentRef} from '../attachments.js';
+import {isPrivateRoom,parseQqRoomId} from '../conversation.js';
+import {PrivateChatAccess} from '../private-chat.js';
 import { reloadAgentConfig, type Config } from '../config.js';
 import { resolveBusinessProfile } from '../business-config.js';
 import { hasWakeCandidate } from '../activation.js';
@@ -15,9 +18,15 @@ export class ScheduledTaskHost {
   readonly service:ScheduledTaskService;
   private actors=new Map<string,Extract<ScheduleActor,{kind:'user'}>>();
   private lastScan=0;
-  constructor(readonly config:Config,readonly store:Store,readonly publisher:PublisherPort){
+  private preparedAttachments=new Map<string,AttachmentRef[]>();
+  constructor(readonly config:Config,readonly store:Store,readonly publisher:PublisherPort,readonly privateAccess=new PrivateChatAccess(config.qq.selfId,config.qq.privateChat),readonly attachments?:AttachmentService){
     this.service=new ScheduledTaskService(store.db,{...config.scheduledTasks,
+      canAccessRoom:roomId=>isPrivateRoom(roomId)?this.privateAccess.allows(roomId):config.qq.allowedGroupIds.some(id=>roomId===`qq:${config.qq.selfId}:${id}`),
       allowedRoomIds:config.qq.allowedGroupIds.map(id=>`qq:${config.qq.selfId}:${id}`)});
+    this.service.validateExecution=schedule=>{
+      const reason=this.unavailable(schedule,reloadAgentConfig(config).config);if(reason)throw new ScheduleError('BLOCKED',reason,409);
+      if(schedule.attachmentRefs?.length)this.attachments?.validateCachedRefs(schedule.roomId,schedule.attachmentRefs);
+    };
   }
   get enabled(){return this.config.scheduledTasks?.enabled===true;}
   recover(){this.store.transaction(()=>{
@@ -37,6 +46,13 @@ export class ScheduledTaskHost {
   });}
   private requireEnabled(){if(!this.enabled)throw new ScheduleError('DISABLED','定时任务功能尚未启用。',403);}
   async actor(message:GroupMessage,registeredBy:'router'|'worker',force=false):Promise<Extract<ScheduleActor,{kind:'user'}>>{
+    const privateRoom=parseQqRoomId(message.roomId);
+    if(privateRoom?.kind==='private'){
+      const lease=this.privateAccess.capture(message.roomId);
+      if(privateRoom.peerId!==message.authorId||this.publisher.verifyFriend&&!await this.publisher.verifyFriend(message.roomId))throw new ScheduleError('FORBIDDEN','当前好友身份不可用。',403);
+      this.privateAccess.assert(lease);
+      return {kind:'user',roomId:message.roomId,memberId:message.authorId,accessKind:'private',roleGroup:'unknown',roleVerifiedAt:Date.now(),sourceMessageIds:[message.id],registeredBy};
+    }
     const key=message.roomId+'\0'+message.authorId,now=Date.now(),maxAge=this.config.scheduledTasks?.roleMaxAgeMs??300_000;
     const cached=this.actors.get(key);
     let roleGroup=message.memberRoleGroup??'unknown',roleVerifiedAt=message.roleVerifiedAt??0;
@@ -50,6 +66,7 @@ export class ScheduledTaskHost {
     this.actors.set(key,actor);return actor;
   }
   private currentActor(message:GroupMessage,registeredBy:'router'|'worker'):Extract<ScheduleActor,{kind:'user'}>{
+    if(isPrivateRoom(message.roomId)){this.privateAccess.capture(message.roomId);return {kind:'user',roomId:message.roomId,memberId:message.authorId,accessKind:'private',roleGroup:'unknown',roleVerifiedAt:Date.now(),sourceMessageIds:[message.id],registeredBy};}
     const cached=this.actors.get(message.roomId+'\0'+message.authorId);
     return {kind:'user',roomId:message.roomId,memberId:message.authorId,roleGroup:cached?.roleGroup??message.memberRoleGroup??'unknown',
       roleVerifiedAt:cached?.roleVerifiedAt??message.roleVerifiedAt??0,sourceMessageIds:[message.id],registeredBy};
@@ -73,9 +90,35 @@ export class ScheduledTaskHost {
     })];
   }
   private mutation(actor:Extract<ScheduleActor,{kind:'user'}>,operation:ScheduleWorkerMutation):ScheduleMutation{
-    if(operation.op!=='create')return operation;
+    if(operation.op!=='create'&&operation.op!=='update')return operation;
+    const data=operation.op==='create'?operation.input:operation.patch;
+    const {attachmentIds,...rest}=data;
+    const refs=attachmentIds===undefined?undefined:this.preparedAttachments.get(this.attachmentKey(actor.roomId,operation));
+    if(attachmentIds!==undefined&&!refs)throw new ScheduleError('ATTACHMENTS_NOT_READY','请先核对所选文件。');
+    if(operation.op==='update')return {...operation,patch:{...rest,...(refs?{attachmentRefs:refs}:{})}};
     const profile=resolveBusinessProfile(reloadAgentConfig(this.config).config,actor.roomId);
-    return {op:'create',input:{...operation.input,roomId:actor.roomId,businessProfileId:profile.id}};
+    return {op:'create',input:{...rest,roomId:actor.roomId,businessProfileId:profile.id,...(refs?{attachmentRefs:refs}:{})}} as ScheduleMutation;
+  }
+  private attachmentKey(roomId:string,operation:ScheduleWorkerMutation){return roomId+'\0'+JSON.stringify(operation);}
+  async prepareRouter(message:GroupMessage,operation:ScheduleModelMutation,signal?:AbortSignal){
+    if(operation.op==='withdraw_proposal')return;
+    const lease=isPrivateRoom(message.roomId)?this.privateAccess.capture(message.roomId):undefined;
+    if(operation.op==='resume'||operation.op==='run_now'){
+      const schedule=this.service.get(await this.actor(message,'router'),operation.id);
+      const reason=this.unavailable(schedule,reloadAgentConfig(this.config).config);if(reason)throw new ScheduleError('BLOCKED',reason,409);
+      if(schedule.attachmentRefs?.length)await this.attachments?.validateRefs(schedule.roomId,schedule.attachmentRefs,signal);
+    }
+    if(operation.op!=='create'&&operation.op!=='update'){if(lease)this.privateAccess.assert(lease);return;}
+    const data=operation.op==='create'?operation.input:operation.patch;
+    if(data.attachmentIds===undefined)return;
+    if(!isPrivateRoom(message.roomId)||!this.attachments)throw new ScheduleError('ATTACHMENTS_UNAVAILABLE','当前会话不支持计划文件绑定。');
+    const kind=operation.op==='create'?operation.input.executionKind:operation.patch.executionKind??this.service.get(await this.actor(message,'router'),operation.id).executionKind;
+    if(kind!=='worker'&&data.attachmentIds.length)throw new ScheduleError('INVALID_ATTACHMENTS','文字提醒不能绑定文件。');
+    const sources=new Set(this.store.db.prepare('SELECT id FROM messages WHERE room=?').all(message.roomId).map(row=>String(row.id)));
+    const refs=await this.attachments.refs(message.roomId,data.attachmentIds,sources,signal);
+    if(lease)this.privateAccess.assert(lease);
+    this.preparedAttachments.set(this.attachmentKey(message.roomId,operation),refs);
+    while(this.preparedAttachments.size>1000)this.preparedAttachments.delete(this.preparedAttachments.keys().next().value!);
   }
   applyRouter(message:GroupMessage,operation:ScheduleModelMutation,slot='main'){
     this.requireEnabled();const actor=this.currentActor(message,'router');
@@ -107,6 +150,7 @@ export class ScheduledTaskHost {
       query:async query=>this.query(await this.actor(source,'worker'),query),
       propose:async(operation,slot)=>{
         this.requireEnabled();this.assertBinding(binding);
+        await this.prepareRouter(source,operation,request.signal);
         const actor=await this.actor(source,'worker'),mutation=this.mutation(actor,operation);
         this.assertBinding(binding);
         return this.service.propose(actor,mutation,binding,`worker:${binding.threadId}:${binding.revision}:${slot}`);
@@ -136,7 +180,7 @@ export class ScheduledTaskHost {
     const actor=this.currentActor(message,'router'),schedule=this.service.get(actor,thread.scheduledTask.scheduleId);
     // A read of one's own task remains allowed after write permission is revoked.
     const policy=this.service.readPolicy();
-    if(actor.roleGroup==='unknown'||!policy.allowedRoleGroups.includes(actor.roleGroup)||Date.now()-actor.roleVerifiedAt>(this.config.scheduledTasks?.roleMaxAgeMs??300_000))
+    if(actor.accessKind!=='private'&&(actor.roleGroup==='unknown'||!policy.allowedRoleGroups.includes(actor.roleGroup)||Date.now()-actor.roleVerifiedAt>(this.config.scheduledTasks?.roleMaxAgeMs??300_000)))
       throw new ScheduleError('ROLE_NOT_ALLOWED','当前角色没有任务管理权限。',403);
     return schedule;
   }
@@ -171,7 +215,8 @@ export class ScheduledTaskHost {
     return Boolean(thread&&thread.status==='running'&&thread.activeRunId===binding.runId&&thread.epoch===binding.epoch&&thread.revision===binding.revision);
   });}
   private unavailable(schedule:Schedule,current:Config){
-    if(!current.qq.allowedGroupIds.some(id=>schedule.roomId===`qq:${current.qq.selfId}:${id}`))return 'room_not_allowed';
+    if(isPrivateRoom(schedule.roomId)){if(!this.privateAccess.allows(schedule.roomId))return 'private_access_denied';}
+    else if(!current.qq.allowedGroupIds.some(id=>schedule.roomId===`qq:${current.qq.selfId}:${id}`))return 'room_not_allowed';
     if(schedule.executionKind==='reminder')return;
     const profile=resolveBusinessProfile(current,schedule.roomId);
     if(schedule.businessProfileId&&profile.id!==schedule.businessProfileId)return 'business_profile_changed';
@@ -204,7 +249,7 @@ export class ScheduledTaskHost {
     const run=this.service.getRun(thread.scheduledTask.scheduleRunId);if(!run)throw new Error('Scheduled run missing');
     const schedule=run.snapshot;
     return {kind:'scheduled',scheduleId:schedule.id,scheduleRunId:run.id,authority:schedule.authority,ownerId:schedule.ownerId,roomId:schedule.roomId,
-      title:schedule.title,instructions:schedule.content,scheduledAt:run.scheduledAt,sourceRefs:schedule.sourceMessageIds,...this.recipients(thread)};
+      attachmentRefs:schedule.attachmentRefs,title:schedule.title,instructions:schedule.content,scheduledAt:run.scheduledAt,sourceRefs:schedule.sourceMessageIds,...this.recipients(thread)};
   }
   localResult(thread:StoredThread){return !!thread.scheduledTask&&this.service.getRun(thread.scheduledTask.scheduleRunId)?.snapshot.deliveryMode==='local';}
   recipients(thread:StoredThread):Pick<OutgoingMessage,'recipientIds'>{

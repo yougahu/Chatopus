@@ -15,6 +15,7 @@
     <button data-view="sessions"><span class="nav-icon">⌘</span>模型与工具轨迹</button>
     <button data-view="memory"><span class="nav-icon">◉</span>记忆</button>
     <div class="nav-divider"></div>
+    <button data-view="private"><span class="nav-icon" aria-hidden="true">☏</span>私聊</button>
     <button data-view="business"><span class="nav-icon">▧</span>业务 · 提示词</button>
     <button data-view="config"><span class="nav-icon">⚙</span>模型 · 插件</button>
   </nav>
@@ -23,7 +24,7 @@
 <main>
   <header class="topbar"><div><div class="breadcrumb">工作空间 <span>/</span> <span id="breadcrumb-view">运行概览</span></div><h1 id="title">运行概览</h1><p id="subtitle">关注正在发生的事，随时追溯每一次回答。</p></div><div class="toolbar"><label class="sr-only" for="source">数据来源</label><select id="source" aria-label="数据来源"><option value="main">当前服务</option></select><button id="refresh" class="button icon-button" aria-label="刷新"><span>↻</span> 刷新</button></div></header>
   <div id="notice" class="notice" role="status"></div>
-  <div id="filters" class="filter-bar" hidden><div class="filter-input"><span>⌕</span><input id="room" placeholder="按群作用域筛选，如 qq:账号:群号" aria-label="群作用域"></div><select id="status" aria-label="状态"><option value="">全部状态</option></select><button id="filter" class="button">应用筛选</button><span class="filter-hint">每页最多 100 条</span></div>
+  <div id="filters" class="filter-bar" hidden><div class="filter-input"><span>⌕</span><input id="room" placeholder="按完整会话筛选，如 qq:账号:private:好友" aria-label="会话作用域"></div><select id="conversation-kind" aria-label="会话类型"><option value="">全部会话</option><option value="group">群聊</option><option value="private">私聊</option></select><select id="status" aria-label="状态"><option value="">全部状态</option></select><button id="filter" class="button">应用筛选</button><span class="filter-hint">每页最多 100 条</span></div>
   <section id="content" aria-live="polite"></section>
   <footer><span id="updated">正在连接本地服务…</span><div id="pager" hidden><button id="prev" class="button">← 上一页</button><span id="page">1</span><button id="next" class="button">下一页 →</button></div><span id="refresh-note"><span class="tiny-dot"></span>概览每 5 秒自动更新</span></footer>
 </main>

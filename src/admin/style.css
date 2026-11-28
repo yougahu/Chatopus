@@ -174,6 +174,29 @@ tr:hover td{background:#fcfdfc}
 .form-field input,.form-field select{width:100%;max-width:none;height:40px;padding:10px 11px;background:#fbfcfb}
 .form-field textarea{width:100%;min-height:120px;resize:vertical;padding:10px 11px;border:1px solid #dce4df;border-radius:8px;background:#fbfcfb;color:#4e6155;font:inherit;font-size:12px;line-height:1.7}
 .form-field textarea:focus{outline:2px solid #bdddc8;border-color:#7fad91;outline-offset:4px}
+.private-chat-form{display:grid;gap:22px}
+.private-chat-form .panel-description{margin:0;font-size:12px;line-height:1.75}
+.private-chat-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:15px 18px;border:1px solid var(--line);border-radius:10px;background:#f7faf8}
+.private-chat-toggle-row>div>label{font-size:13px;font-weight:600;cursor:pointer}
+.private-chat-toggle-row p{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.6}
+.private-chat-switch{position:relative;display:flex;align-items:center;flex:0 0 44px;width:44px;height:44px;cursor:pointer}
+.private-chat-switch input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}
+.private-chat-switch>span{width:44px;height:26px;border:1px solid #b8c5bd;border-radius:20px;background:#c8d2cc;pointer-events:none;transition:background .16s,border-color .16s}
+.private-chat-switch>span::after{content:"";display:block;width:20px;height:20px;margin:2px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #18292426;transition:transform .16s}
+.private-chat-switch input:checked+span{background:var(--green);border-color:var(--green)}
+.private-chat-switch input:checked+span::after{transform:translateX(18px)}
+.private-chat-switch input:focus-visible+span{outline:2px solid var(--green);outline-offset:4px}
+.private-chat-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px 20px}
+.private-chat-form .form-field{gap:8px}
+.private-chat-form .form-field label{font-size:12px;font-weight:550;color:#425d4e}
+.private-chat-form .form-field input,.private-chat-form .form-field select,.private-chat-form .form-field textarea{font-size:13px}
+.private-chat-form .form-field textarea{min-height:112px}
+.private-chat-form .field-help{font-size:11px;color:var(--muted)}
+.private-chat-feedback{display:grid;gap:10px}
+.private-chat-feedback .notice{margin:0;line-height:1.7}
+.private-chat-form .form-actions{margin-top:0;padding-top:18px;flex-wrap:wrap}
+@media(max-width:700px){.private-chat-fields{grid-template-columns:1fr}.private-chat-toggle-row{padding:12px 14px;gap:14px}.private-chat-form{gap:20px}}
+@media(prefers-reduced-motion:reduce){.private-chat-switch>span,.private-chat-switch>span::after{transition:none}}
 .activation-help{margin-top:12px}
 .activation-card .panel-head{flex-wrap:wrap}
 .activation-card .form-actions{flex-wrap:wrap}

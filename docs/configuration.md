@@ -114,7 +114,7 @@ Coordinator 为同一任务版本维护固定的 Worker 截止时间，默认从
 
 ## 业务、能力与记忆
 
-`business` 选择默认业务、按群绑定及提示词；`skills` / `extensions` 注册能力，业务中的 `skillIds` / `extensionIds` 决定启用范围。`plugins` 是按角色装载的 Cordis 插件，`browser` 是 Worker 的浏览器 MCP 配置，二者不等同于可按业务选择的扩展。`python` 默认 `python3`，供 CSV 等工具使用。浏览器默认采用 `networkIsolation: "managed"`，要求固定版本的 Playwright MCP 并通过宿主公网代理访问；自定义 MCP 需由部署者隔离网络并显式选择 `external`。具体配置见 [浏览器接入](skills.md)。
+`business` 选择默认业务、按会话绑定及提示词；`skills` / `extensions` 注册能力，业务中的 `skillIds` / `extensionIds` 决定启用范围。`plugins` 是按角色装载的 Cordis 插件，`browser` 是 Worker 的浏览器 MCP 配置，二者不等同于可按业务选择的扩展。`python` 默认 `python3`，供 CSV 等工具使用。浏览器默认采用 `networkIsolation: "managed"`，要求固定版本的 Playwright MCP 并通过宿主公网代理访问；自定义 MCP 需由部署者隔离网络并显式选择 `external`。具体配置见 [浏览器接入](skills.md)。
 
 `botCallNames` 代码回退为 `["机器人"]`，示例为 `["助手", "机器人"]`；空数组表示只通过 @ 唤起。最多 32 个，每个不超过 80 字符。技能、扩展、自定义字段与人格均无内置业务预选。人格正文保存在 `business.profiles.<id>.personaText`，支持 Markdown，最多 8,000 个 Unicode 字符，留空不加载额外人格。未设置正文时兼容读取旧 `personaFile`；后台载入旧正文后可直接编辑并保存迁移。
 
@@ -142,7 +142,8 @@ Coordinator 为同一任务版本维护固定的 Worker 截止时间，默认从
 | 模型、端点、角色密钥、provider profile | 新调用热加载；在途 Worker 保留启动快照 |
 | 业务指引、能力选择、业务人格正文及旧文件引用、技能和扩展注册、成员字段定义 | 新调用加载新配置；后台编辑目录按当前配置读取 |
 | 兼容的旧人格文件内容、SKILL.md、扩展入口文件 | 后续调用读取；扩展传递依赖或安装依赖变更后应重启以清除模块缓存 |
-| 唤起称呼、QQ、并发/时限/步骤、持续 Router 开关、存储、plugins、browser、python | 重启机器人 |
+| `qq.privateChat` 的四个字段 | 运行服务每秒检查，事务清理成功后应用；后台保存不等于生效 |
+| 唤起称呼、其他 QQ 字段、并发/时限/步骤、持续 Router 开关、存储、plugins、browser、python | 重启机器人 |
 | `scheduledTasks` 部署开关、时区及额度／频率／并发／超时参数 | 重启机器人及后台；已登记计划保留各自时间规则及参数 |
 | 后台定时任务计划与群聊角色策略 | 写入状态库后生效；执行和运行中止由机器人服务处理 |
 | OpenViking 开关、地址、namespace、根凭据、摄取参数 | 重启机器人及后台；后台记忆查询也持有启动配置 |
@@ -163,3 +164,7 @@ Coordinator 为同一任务版本维护固定的 Worker 截止时间，默认从
 | `npm run dev -- help` | 查看 CLI 用法 |
 
 `doctor` 成功不证明模型 ID、API Key 或生产端点可用，也不完整验证兼容的旧人格文件及所有工具依赖。扩展诊断会导入可信模块；`ask` / `replay` 会使用当前业务与能力配置，不等于无副作用的离线测试。重复回放可能覆盖同名结果文件，需保留报告时先归档。离线检查与真实模型验证见 [验证方法](verification.md)。
+
+## QQ 私聊与附件
+
+`qq.privateChat` 默认关闭；`enabled`、`allowedUserIds`（最多 1000）、`maxMessagesPerMinute`（1–600，默认 30）和 `replyMode`（`plain`/`quote`，默认 `plain`）支持热更新。`qq.privateFiles` 固定私聊文件桥接实现、版本与输入/输出契约，重启生效。`attachments` 默认释放有效引用后保留 7 天、最大 10 GiB、预留磁盘 512 MiB，重启生效。完整示例及业务绑定见 [私聊使用说明](private-chat.md)。

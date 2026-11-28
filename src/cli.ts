@@ -1,3 +1,4 @@
+import {isPrivateRoom,qqId} from './conversation.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig, safeConfig } from './config.js';
@@ -6,6 +7,7 @@ import { Store } from './store.js';
 import { Coordinator } from './coordinator.js';
 import { OneBotAdapter } from './platform/onebot.js';
 import { resolveOneBotImage } from './platform/media.js';
+import { sourceImage } from './runtime/incoming-images.js';
 import { MemoryPublisher } from './platform/memory.js';
 import { evaluateReplay } from './replay.js';
 import { loadExtensions } from './capabilities.js';
@@ -36,9 +38,10 @@ async function main(){
       catch{extensions.push({id:spec.id,available:false,error:'EXTENSION_UNAVAILABLE'});}
     }
     const browser=config.browser?await probeExecutable(config.browser.command):undefined;
-    const checks={skills,extensions,browser,nodeVersion:process.version,routerApiConfigured:!!config.routerApiKey,workerApiConfigured:!!config.workerApiKey};
+    const qq={enabled:config.qq.enabled,configured:!config.qq.enabled||!!qqId(config.qq.selfId)&&!!config.qq.accessToken,groups:config.qq.allowedGroupIds.length,privatePeers:config.qq.privateChat?.enabled?config.qq.privateChat.allowedUserIds.length:0,privateFiles:config.qq.privateFiles?{implementation:config.qq.privateFiles.implementation,version:config.qq.privateFiles.version,verification:'runtime-version-check-and-operator-integration-required'}:'not-configured',zeroTargetsAllowed:true};
+    const checks={skills,extensions,browser,qq,nodeVersion:process.version,routerApiConfigured:!!config.routerApiKey,workerApiConfigured:!!config.workerApiKey};
     console.log(JSON.stringify({config:safeConfig(config),checks},null,2));
-    if(skills.some(s=>!s.available)||extensions.some(e=>!e.available)||browser?.available===false)process.exitCode=1;
+    if(!qq.configured||skills.some(s=>!s.available)||extensions.some(e=>!e.available)||browser?.available===false)process.exitCode=1;
     return;
   }
   if(command==='replay'){
@@ -63,7 +66,7 @@ async function main(){
     }finally{await coordinator.close();store.close();}return;
   }
   if(command==='serve'){
-    if(!config.qq.enabled)throw new Error('QQ adapter is disabled. Configure qq.enabled, selfId, allowedGroupIds and ONEBOT_ACCESS_TOKEN first.');
+    if(!config.qq.enabled)throw new Error('QQ adapter is disabled. Configure qq.enabled, selfId, allowed targets and ONEBOT_ACCESS_TOKEN first.');
     const release=acquireInstanceLock(join(config.stateDir,'instance.lock'));
     process.once('exit',release);
     const store=new Store(join(config.stateDir,'state.sqlite'));
@@ -79,13 +82,16 @@ async function main(){
     };
     try{
       runtime=await DshRuntime.create(config,{
-        resolveImage:(a,context)=>resolveOneBotImage(adapter,a,{
-          cacheRoot:config.qq.imageCacheRoot,cacheDir:join(config.stateDir,'incoming-images'),
-          cacheKey:JSON.stringify([context.roomId,context.messageId,context.attachmentIndex]),
-          onDiagnostic:event=>store.telemetry('image_receive',{...context,...event}),
-        }),onImage:event=>store.telemetry('image_input',event),onMetrics:m=>store.telemetry('model',{...m,eventId:m.measurementId}),onModelCall:m=>store.telemetry('model_call',{...m,eventId:m.callId}),onToolAudit:event=>store.telemetry('domain_tool',event)});
+        resolveImage:(_marker,context,signal)=>{
+          const a=sourceImage(store.message(context.messageId),context);
+          const privateRoom=isPrivateRoom(context.roomId);
+          const resolve=(inputSignal?:AbortSignal)=>resolveOneBotImage(adapter,a,{signal:inputSignal,cacheRoot:config.qq.imageCacheRoot,
+            cacheDir:privateRoom?undefined:join(config.stateDir,'incoming-images'),cacheKey:JSON.stringify([context.roomId,context.messageId,context.attachmentIndex]),
+            onDiagnostic:event=>store.telemetry('image_receive',{...context,...event})});
+          return privateRoom?coordinator!.attachments.image(context.roomId,context.messageId,context.attachmentIndex,resolve,signal):resolve(signal);
+        },onImage:event=>store.telemetry('image_input',event),onMetrics:m=>store.telemetry('model',{...m,eventId:m.measurementId}),onModelCall:m=>store.telemetry('model_call',{...m,eventId:m.callId}),onToolAudit:event=>store.telemetry('domain_tool',event)});
       coordinator=new Coordinator(config,store,runtime,adapter,true);
-      await adapter.start();await coordinator.start();
+      await coordinator.start(false);await adapter.start();
     }catch(error){await close();throw error;}
     console.log(`Chatopus listening on 127.0.0.1:${config.qq.port}; ${config.qq.allowedGroupIds.length} allowed group(s).`);
     process.once('SIGINT',()=>void close());process.once('SIGTERM',()=>void close());return;

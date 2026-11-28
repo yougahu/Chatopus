@@ -30,13 +30,13 @@
 }
 ```
 
-示例 `document-reader` 必须先在顶层 `skills` 中声明本地路径。业务配置只选择已注册能力；技能文件是否可用在运行及 doctor 阶段检查。未绑定的群使用默认配置，群绑定是完整 ID 精确匹配。`personaText` 仅属于所在业务，直接保存人格正文，最多 8,000 个 Unicode 字符；空白正文不加载额外人格。旧 `personaFile` 作为兼容输入继续读取，后台会载入正文，并在保存后迁移为 `personaText`，不修改原文件。
+示例 `document-reader` 必须先在顶层 `skills` 中声明本地路径。业务配置只选择已注册能力；技能文件是否可用在运行及 doctor 阶段检查。未绑定的会话使用默认配置，会话绑定是完整 ID 精确匹配。`personaText` 仅属于所在业务，直接保存人格正文，最多 8,000 个 Unicode 字符；空白正文不加载额外人格。旧 `personaFile` 作为兼容输入继续读取，后台会载入正文，并在保存后迁移为 `personaText`，不修改原文件。
 
 注册并启用的完整操作见 [技能和扩展](skills.md)；自定义字段先在 `memory.fields` 声明，再通过业务 `memoryFields` 选择，见 [成员字段](member-fields.md)。安装目录、扩展模块及字段定义仍由部署者在配置文件中管理。
 
 后台编辑页分别呈现共同背景、Router 指引和 Worker 指引。业务指引描述工作范围和交付，不替代宿主协议、身份归属、资源隔离和工具校验。详细知识与脚本说明应放在 skill 中按需读取。
 
-编辑页分为「业务提示词」「技能与工具」「记忆与风格」「群与默认配置」。新增按钮打开创建弹窗，可从空白开始或复制已有业务；创建后先形成草稿，点击「保存全部配置」才生效。技能、工具扩展和自定义成员字段从已注册目录勾选，群绑定以可编辑行维护。
+编辑页分为「业务提示词」「技能与工具」「记忆与风格」「群与默认配置」。新增按钮打开创建弹窗，可从空白开始或复制已有业务；创建后先形成草稿，点击「保存全部配置」才生效。技能、工具扩展和自定义成员字段从已注册目录勾选，会话绑定以可编辑行维护。
 
 切换业务、切换后台页面和页内刷新都会保留未保存草稿；关闭或重新加载浏览器页面时会提示尚未保存。草稿仅保存在当前页面内存中。使用「放弃草稿」并确认后重新读取服务端配置。保存状态和错误提示始终显示在底部操作栏，提示词预览使用当前草稿。
 
@@ -62,7 +62,7 @@
 | GET `/api/business-config` | 返回 settings、revision、appliesTo、catalog（已注册技能/扩展/成员字段）及 personaLoadErrors；可读的旧人格正文带入 settings，revision 仍对应已保存配置 |
 | POST `/api/business-config` | 接受 `{settings, revision}`，校验后保存 |
 | GET `/api/business-config/history` | 最近100个历史配置快照的版本及名称 |
-| POST `/api/business-config/rollback` | 接受 `{targetRevision, revision}`，回退整个业务配置和群绑定 |
+| POST `/api/business-config/rollback` | 接受 `{targetRevision, revision}`，回退整个业务配置和会话绑定 |
 | POST `/api/business-config/preview` | 接受 `{settings, roomId?, profileId?}`，预览未保存配置，不调用模型或工具 |
 
 预览包含基础规则、渠道格式、业务指引和人格。动态工具 schema、成员字段、当前称呼及任务上下文仍由实际调用注入；预览会明确标注这个边界。修改工具集合或业务语义时，运行时使用配置指纹处理持续会话恢复，在途任务使用原快照。

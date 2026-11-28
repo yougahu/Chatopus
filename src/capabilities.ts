@@ -21,6 +21,7 @@ export interface ToolAuditEvent {
 }
 export interface CapabilityConfig {root:string;skills:SkillSpec[];extensions:ExtensionSpec[];python:string;browser?:BrowserConfig;onAudit?:(event:ToolAuditEvent)=>void}
 export interface CapabilityContext {
+  attachmentWriter?:import('./attachments.js').ManagedFileWriter;
   threadId:string;runId:string;revision:number;workspace:string;question:string;
   artifactWorkspace?:string;historyWorkspace?:string;routingMetadata?:Record<string,unknown>;
   execution?:{kind:'scheduled';authority:'system'|'user';scheduleId:string;scheduleRunId:string};
@@ -111,7 +112,7 @@ export async function createCapabilitySession(config:CapabilityConfig,context:Ca
   const resourceRoot={type:'string',enum:[...roots.keys()],description:'workspace: persistent artifacts for this thread; run: current run files; history: read-only earlier r-<run-id>/ files; enabled skill IDs: read-only skill files.'};
   const writableRoot={type:'string',enum:['workspace','run'],description:'Defaults to workspace, the persistent artifacts of this thread.'};
   const integer=(minimum:number,maximum:number)=>({type:'integer',minimum,maximum});
-  const images=new hostSdk.ReplyImages(context.workspace),files=new ReplyFiles(context.workspace),tools:ToolDefinition[]=[];
+  const images=new hostSdk.ReplyImages(context.workspace,context.attachmentWriter),files=new ReplyFiles(context.workspace,context.attachmentWriter),tools:ToolDefinition[]=[];
   const lifetime=new AbortController();let closing:Promise<void>|undefined;const seen=new Set<string>();
   let closed=false;const sessions:CapabilitySession[]=[];
   const browser=config.browser?new PublicBrowser(config.browser,workspace):undefined;
@@ -143,7 +144,7 @@ export async function createCapabilitySession(config:CapabilityConfig,context:Ca
     return {text:content.slice(offset,offset+limit),offset,totalCharacters:content.length,truncated:offset+limit<content.length};
   });
   add('artifact_write','Write a UTF-8 artifact in this task; skills and history remain read-only.',schema({path:str,text:str,root:writableRoot},['path','text']),async a=>{const target=await file(a.root??'workspace',a.path,true);await fs.mkdir(resolve(target,'..'),{recursive:true});await fs.writeFile(target,text(a.text,2_000_000),{mode:0o600});return {path:a.path,root:a.root??'workspace'};});
-  add('artifact_publish','Prepare a task file for QQ group delivery. Returns an ID to select in the final report files array; does not upload immediately.',schema({path:str,root:writableRoot,name:str},['path']),async(a,signal)=>{
+  add('artifact_publish','Prepare a task file for delivery to the current conversation. Returns an ID to select in the final report files array; does not upload immediately.',schema({path:str,root:writableRoot,name:str},['path']),async(a,signal)=>{
     const selected=a.root??'workspace';if(selected!=='workspace'&&selected!=='run')throw new Error('Only current task workspace or run files can be prepared for delivery');
     return files.publish(roots.get(selected)!,a.path,a.name,signal);
   });

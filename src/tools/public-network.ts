@@ -53,9 +53,9 @@ export const publicLookup: LookupFunction = (hostname, options, callback) => {
 
 export class PublicWebAccess {
   private readonly agent = new Agent({ connect: { lookup: publicLookup, timeout: 15_000 } });
-  fetch(raw: string, signal?: AbortSignal) {
+  fetch(raw: string, signal?: AbortSignal, redirect:RequestRedirect='error') {
     const url = publicWebUrl(raw);
-    const options: RequestInit & { dispatcher: Agent } = { dispatcher: this.agent, redirect: 'error',
+    const options: RequestInit & { dispatcher: Agent } = { dispatcher: this.agent, redirect,
       signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]) };
     return fetch(url, options);
   }

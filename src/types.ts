@@ -1,5 +1,12 @@
 export interface Attachment {
-  kind: 'image';
+  kind: 'image'|'file';
+  attachmentId?:string;
+  name?:string;
+  bytes?:number;
+  sha256?:string;
+  sourceInputId?:string;
+  localFile?:string;
+  downloadError?:string;
   url?: string;
   file?: string;
   mimeType?: string;
@@ -25,6 +32,8 @@ export interface GroupMessage {
 export interface OutgoingMessage {
   roomId: string;
   replyToMessageId?: string;
+  quoteReply?:boolean;
+  sourceInputId?:string;
   text: string;
   /** Explicit platform member IDs to mention in the destination room. */
   recipientIds?: string[];
@@ -67,12 +76,17 @@ export interface BotReply {
   sentAt: number;
 }
 export interface PublisherPort {
+  privateFileUrl?(roomId:string,attachment:Attachment):Promise<string|undefined>;
+  readonly privateAccess?:import('./private-chat.js').PrivateChatAccess;
+  verifyFriend?(roomId:string):Promise<boolean>;
+  setDeliveryGuard?(guard:(key:string,roomId:string)=>boolean):void;
   send(message: OutgoingMessage, dedupeKey: string): Promise<SendReceipt>;
   uploadFile?(roomId: string, file: OutgoingFile, dedupeKey: string): Promise<SendReceipt>;
   resolveMemberRole?(roomId:string,memberId:string):Promise<{roleGroup:'group_admin'|'member'|'unknown';verifiedAt:number}>;
 }
 export type ThreadStatus = 'queued' | 'running' | 'needs_input' | 'idle' | 'failed' | 'cancelled';
 export interface ThreadCard {
+  followupOf?:{scheduleId:string;scheduleRunId:string;threadId:string};
   id: string;
   roomId: string;
   subject: string;
@@ -96,6 +110,7 @@ export interface ScheduledTaskBinding {
 }
 /** Host-created execution input. This is not a platform message or a new user instruction. */
 export interface ScheduledExecutionInput {
+  attachmentRefs?:import('./attachments.js').AttachmentRef[];
   kind:'scheduled';scheduleId:string;scheduleRunId:string;authority:'user'|'system';
   ownerId:string|null;roomId:string;title:string;instructions:string;scheduledAt:number;sourceRefs:string[];
   recipientIds?:string[];
@@ -173,6 +188,8 @@ export type MessageRouteAction = (
   | ({ action: 'append_thread'; sourceMessageIds: string[]; threadId: string; kind?: 'supplement' | 'correction'; acknowledgement?: string } & RouteContext)
   | { action: 'request_status' | 'request_cancel'; sourceMessageIds: string[]; threadId: string }
   | { action: 'request_handoff'; sourceMessageIds: string[]; threadId: string; view?:'current'|'previous'|'changes' }
+  | {action:'resolve_delivery';sourceMessageIds:string[];outboxId:string;partIds?:string[];decision:'received'|'abandon';expectedResolutionVersion:number;resumeSchedule?:boolean}
+  | {action:'resend_delivery';sourceMessageIds:string[];outboxId:string;confirmedUnknown?:boolean;all?:boolean}
   | { action:'manage_schedule';sourceMessageIds:string[];operation:import('./scheduled-tasks/tools.js').ScheduleModelMutation }
 ) & MemberMemoryProposal;
 export type RouteAction =
@@ -265,6 +282,7 @@ export interface ToolDefinition {
   execute(args: unknown, signal?: AbortSignal): Promise<unknown>;
 }
 export interface WorkerRequest {
+  attachmentWriter?:import('./attachments.js').ManagedFileWriter;
   budget?:{remainingSteps:number;deadlineAt:number};
   thread: ThreadCard;
   runId: string;

@@ -32,21 +32,21 @@ describe('scheduled task administration',()=>{
   expect(cleared.status).toBe(200);expect(cleared.body.schedule.recipientIds).toEqual([]);
   expect((await post('/api/schedules',{input:{...draft(),recipientIds:['']},idempotencyKey:'invalid-recipient'})).status).toBe(400);
  });
- it('initializes the full version-2 store when schedules are the first page opened on a clean install',async()=>{
+ it('initializes the full version-3 store when schedules are the first page opened on a clean install',async()=>{
   const root=mkdtempSync(join(tmpdir(),'boe-admin-schedules-clean-'));cleanup.push(()=>rmSync(root,{recursive:true,force:true}));
   const config=loadConfig(root),file=join(config.stateDir,'state.sqlite'),server=new AdminServer(config,0),url=await server.start();cleanup.push(()=>server.close());
   expect(existsSync(file)).toBe(false);
   const scheduleResponse=await fetch(url+'/api/schedules');expect(scheduleResponse.status).toBe(200);expect(await scheduleResponse.json()).toMatchObject({items:[],total:0,enabled:false,running:false});
   const overview=await fetch(url+'/api/overview');expect(overview.status).toBe(200);expect(await overview.json()).toMatchObject({messages:0,threads:[],outbox:[],running:false});
   const threads=await fetch(url+'/api/threads');expect(threads.status).toBe(200);expect(await threads.json()).toEqual([]);
-  const db=new DatabaseSync(file,{readOnly:true});try{expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(2);}finally{db.close();}
+  const db=new DatabaseSync(file,{readOnly:true});try{expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(3);}finally{db.close();}
  });
- it('refuses to modify a database whose primary schema is newer than version 2',async()=>{
+ it('refuses to modify a database whose primary schema is newer than version 3',async()=>{
   const root=mkdtempSync(join(tmpdir(),'boe-admin-schedules-newer-'));cleanup.push(()=>rmSync(root,{recursive:true,force:true}));
   const config=loadConfig(root),file=join(config.stateDir,'state.sqlite'),server=new AdminServer(config,0),url=await server.start();cleanup.push(()=>server.close());
-  const db=new DatabaseSync(file);try{db.exec('PRAGMA user_version=3');}finally{db.close();}
+  const db=new DatabaseSync(file);try{db.exec('PRAGMA user_version=4');}finally{db.close();}
   expect((await fetch(url+'/api/schedules')).status).toBe(503);
-  const check=new DatabaseSync(file,{readOnly:true});try{expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(3);expect(check.prepare("SELECT name FROM sqlite_master WHERE name='schedules'").get()).toBeUndefined();}finally{check.close();}
+  const check=new DatabaseSync(file,{readOnly:true});try{expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(4);expect(check.prepare("SELECT name FROM sqlite_master WHERE name='schedules'").get()).toBeUndefined();}finally{check.close();}
  });
  it('creates only system tasks, exposes truthful offline state, and deduplicates retried requests',async()=>{
   const{post,url,service}=await setup();const input=draft();const a=await post('/api/schedules',{input,idempotencyKey:'create-one'});expect(a.status).toBe(201);expect(a.body.schedule).toMatchObject({authority:'system',ownerId:null,registeredBy:'admin',businessProfileId:'default'});expect(a.body.running).toBe(false);expect(a.body.message).toContain('等待');

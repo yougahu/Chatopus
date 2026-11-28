@@ -114,6 +114,7 @@ export class RouterSessionStore {
       CREATE UNIQUE INDEX IF NOT EXISTS router_sessions_active_id ON router_sessions(session_id);
       CREATE TABLE IF NOT EXISTS router_turns(id TEXT PRIMARY KEY,room TEXT NOT NULL,trigger_kind TEXT NOT NULL,trigger_key TEXT NOT NULL,input_hash TEXT NOT NULL,inputs TEXT NOT NULL,generation INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','committed','failed')),attempts INTEGER NOT NULL DEFAULT 0,request TEXT NOT NULL,actions TEXT,receipt TEXT,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(room,trigger_kind,trigger_key));
       CREATE INDEX IF NOT EXISTS router_turns_room_state ON router_turns(room,state,created_at);
+      CREATE INDEX IF NOT EXISTS router_turns_updated ON router_turns(updated_at);
       CREATE UNIQUE INDEX IF NOT EXISTS router_turns_one_pending ON router_turns(room) WHERE state='pending';
       CREATE TABLE IF NOT EXISTS router_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL,origin TEXT NOT NULL CHECK(origin IN ('input','host')),source_id TEXT NOT NULL,payload TEXT NOT NULL,owner_turn_id TEXT,created_at INTEGER NOT NULL,UNIQUE(room,origin,source_id),CHECK(origin='input' OR owner_turn_id IS NULL));
       CREATE INDEX IF NOT EXISTS router_events_room_seq ON router_events(room,seq);

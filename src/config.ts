@@ -1,3 +1,5 @@
+import {privateFileContract,type PrivateFileContract} from './platform/private-files.js';
+import {privateChatSettings,type PrivateChatSettings} from './private-chat.js';
 import {workerInputScheduling,type WorkerInputScheduling} from './worker-input-scheduling.js';
 import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -31,6 +33,7 @@ export interface SharedMemoryConfig {
 
 export interface Config {
   scheduledTasks?:Omit<ScheduleOptions,'now'|'allowedRoomIds'> & {enabled:boolean;scanIntervalMs?:number;concurrency?:number};
+  attachments?:{retentionDays:number;maxStorageBytes:number;minFreeDiskBytes:number};
   root: string;
   stateDir: string;
   router: ModelSelection;
@@ -65,7 +68,7 @@ export interface Config {
   extensions: ExtensionSpec[];
   python: string;
   browser?: BrowserConfig;
-  qq: { enabled: boolean; selfId: string; accessToken: string; allowedGroupIds: string[]; host: string; port: number; imageCacheRoot?:string };
+  qq: { enabled: boolean; selfId: string; accessToken: string; allowedGroupIds: string[]; host: string; port: number; imageCacheRoot?:string; privateChat?:PrivateChatSettings; privateFiles?:PrivateFileContract };
 }
 export function validateBusinessReferences(config:Pick<Config,'business'|'skills'|'extensions'|'memory'>):void {
   for(const profile of Object.values(config.business?.profiles??{})){
@@ -141,6 +144,7 @@ export function loadConfig(root = process.cwd(), overrides: Partial<Config> = {}
       rootKeyEnv:'OPENVIKING_ROOT_API_KEY',timeoutMs:15_000,recallBytes:6000,ingestBatchSize:32,ingestBatchWindowMs:300_000,
       ...disk.memory,
     },
+    attachments:{retentionDays:7,maxStorageBytes:10*1024**3,minFreeDiskBytes:512*1024**2,...disk.attachments},
     concurrency: disk.concurrency ?? 5,
     workerTimeoutMs: disk.workerTimeoutMs ?? 3_600_000,
     workerInputScheduling:workerInputScheduling(disk.workerInputScheduling),
@@ -162,12 +166,17 @@ export function loadConfig(root = process.cwd(), overrides: Partial<Config> = {}
     extensions: disk.extensions ?? [],
     python: disk.python ?? 'python3',
     browser: disk.browser,
-    qq: { enabled: disk.qq?.enabled ?? false, selfId: env.QQ_SELF_ID ?? disk.qq?.selfId ?? '',
+    qq: { privateFiles:privateFileContract(disk.qq?.privateFiles),privateChat:privateChatSettings(disk.qq?.privateChat), enabled: disk.qq?.enabled ?? false, selfId: env.QQ_SELF_ID ?? disk.qq?.selfId ?? '',
       accessToken: env.ONEBOT_ACCESS_TOKEN ?? '', allowedGroupIds: disk.qq?.allowedGroupIds ?? [],
       imageCacheRoot:(env.QQ_IMAGE_CACHE_ROOT||disk.qq?.imageCacheRoot)?localPath(env.QQ_IMAGE_CACHE_ROOT||disk.qq.imageCacheRoot):undefined,
       host: '127.0.0.1', port: disk.qq?.port ?? 8083 },
     ...overrides,
   };
+  config.qq={...config.qq,privateChat:privateChatSettings(config.qq.privateChat),privateFiles:privateFileContract(config.qq.privateFiles)};
+  if(config.attachments){
+    const a=config.attachments;
+    if(!Number.isSafeInteger(a.retentionDays)||a.retentionDays<1||a.retentionDays>3650||!Number.isSafeInteger(a.maxStorageBytes)||a.maxStorageBytes<20*1024**2||!Number.isSafeInteger(a.minFreeDiskBytes)||a.minFreeDiskBytes<0)throw new Error('Invalid attachments configuration');
+  }
   config.routerApiKey=overrides.routerApiKey??roleCredential(config,'router',env);
   if(config.scheduledTasks){
     const tasks=config.scheduledTasks;
