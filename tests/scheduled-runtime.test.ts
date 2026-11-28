@@ -44,6 +44,21 @@ async function fixture(adapter:Adapter,options:Partial<DshOptions>={}){
 }
 
 describe('scheduled task model boundaries',()=>{
+  it('requires an explicit execution mode when either model path edits content',async()=>{
+    const operation={op:'update' as const,id:'s1',expectedVersion:1,patch:{content:'Compose a different short story for each run.'}};
+    expect(()=>parseRoutesForRequest(JSON.stringify([{action:'manage_schedule',sourceMessageIds:[message.id],operation}]),routerRequest)).toThrow('executionKind');
+    const propose=vi.fn(async()=>({id:'p1',status:'proposed'}));
+    const worker=createWorkerScheduleTool(request('/tmp'),{query:async()=>[],propose});
+    await expect(worker.execute({operation:'propose',slot:'edit',mutation:operation})).rejects.toThrow('executionKind');
+    expect(propose).not.toHaveBeenCalled();
+    const reviewed={...operation,patch:{...operation.patch,executionKind:'worker' as const}};
+    expect(parseRoutesForRequest(JSON.stringify([{action:'manage_schedule',sourceMessageIds:[message.id],operation:reviewed}]),routerRequest)[0]).toMatchObject({operation:reviewed});
+    await worker.execute({operation:'propose',slot:'edit',mutation:reviewed});
+    expect(propose).toHaveBeenCalledWith(reviewed,'edit',undefined);
+    expect(scheduleModelMutationSchema.parse({...operation,patch:{title:'New title'}})).toMatchObject({patch:{title:'New title'}});
+    // Quoted wording is valid fixed text; the host must not guess from keywords.
+    expect(scheduleModelMutationSchema.parse({...operation,patch:{executionKind:'reminder',content:'Write a story for your homework.'}})).toMatchObject({patch:{executionKind:'reminder'}});
+  });
   it('accepts explicit recipients in registrations and patches while keeping them visible in query summaries',async()=>{
     const operation={...create,input:{...create.input,recipientIds:['alice','bob']}};
     expect(parseRoutesForRequest(JSON.stringify([{action:'manage_schedule',sourceMessageIds:[message.id],operation}]),routerRequest)[0]).toMatchObject({operation});
