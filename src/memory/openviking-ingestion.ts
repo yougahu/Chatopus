@@ -20,6 +20,7 @@ export interface OpenVikingIngestionEvent {
   coveredSeq: number; targetSeq: number; sessionId?: string; code?: string;
 }
 export interface OpenVikingIngestionOptions {
+  access?:(room:string)=>AbortSignal|false|undefined;
   db: DatabaseSync;
   sharedMemory: SharedMemoryService;
   source: RoomMemoryStore;
@@ -186,6 +187,7 @@ export class OpenVikingIngestion {
     let next = Infinity;
     const all = this.lanes(), after = all.findIndex(lane => lane.key === this.lastScheduled) + 1;
     for (const lane of [...all.slice(after), ...all.slice(0, after)]) {
+      const access=this.options.access?.(lane.room);if(access===false)continue;
       if ((!lane.batch && lane.covered >= lane.target) || lane.blocked || this.running.has(lane.key)) continue;
       if ([...this.running.values()].some(run => run.room === lane.room)) continue;
       const maintenanceUntil = lane.batch ? 0 : this.options.prepareAfter?.() ?? 0;
@@ -197,8 +199,8 @@ export class OpenVikingIngestion {
       if (this.running.size >= this.concurrency) break;
       this.lastScheduled = lane.key;
       const abort = new AbortController();
-      const promise = this.step(lane, abort.signal).catch(error => {
-        if (this.closed || abort.signal.aborted) return;
+      const promise = this.step(lane,access?AbortSignal.any([abort.signal,access]):abort.signal).catch(error => {
+        if (this.closed || abort.signal.aborted || access?.aborted) return;
         lane.failures++; lane.lastError = codeOf(error);
         lane.blocked = (error instanceof IngestionError && error.permanent) || lane.failures >= this.maxFailures;
         lane.retryAt = lane.blocked ? 0 : Date.now() + Math.min(this.maxRetryMs, this.retryMs * 2 ** (lane.failures - 1));
@@ -258,6 +260,7 @@ export class OpenVikingIngestion {
     lane.retryAt = Date.now() + this.retryMs; this.save(lane); this.emit('abandoned', lane);
   }
   private async step(lane: Lane, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
     this.service(lane);
     if (!lane.batch) this.freeze(lane);
     if (!lane.batch) return;
@@ -266,21 +269,25 @@ export class OpenVikingIngestion {
     let meta: Record<string, any> | null;
     try { meta = object(await client.session(lane.account, batch.sessionId, signal)); }
     catch (error) { if (!missing(error)) throw error; meta = null; }
+    signal.throwIfAborted();
     if (!meta) {
       if (batch.phase === 'prepared') {
         batch.phase = 'creating'; this.save(lane);
         await client.createSession(lane.account, batch.sessionId, signal);
+    signal.throwIfAborted();
         meta = object(await client.session(lane.account, batch.sessionId, signal));
       } else if (batch.phase === 'creating') {
         if (++batch.uncertainReads >= this.uncertainChecks) this.abandon(lane); else this.pending(lane);
         return;
       } else throw new IngestionError('SESSION_MISSING_AFTER_APPEND', true);
     }
+    signal.throwIfAborted();
     if (meta.auto_commit_policy !== null) throw new IngestionError('AUTO_COMMIT_NOT_DISABLED', true);
     if (meta.session_id !== batch.sessionId || (meta.commit_count ?? 0) > 1) throw new IngestionError('SESSION_IDENTITY_MISMATCH', true);
     if (!['committing', 'archived'].includes(batch.phase) && (meta.commit_count ?? 0) !== 0)
       throw new IngestionError('UNEXPECTED_SESSION_COMMIT', true);
     const archived = await this.archive(lane, signal);
+    signal.throwIfAborted();
     if (archived) { await this.reconcileArchive(lane, archived, signal); return; }
     if (batch.phase === 'archived') throw new IngestionError('ARCHIVE_MISSING', true);
     if (batch.phase === 'committing') {
@@ -288,6 +295,7 @@ export class OpenVikingIngestion {
       this.pending(lane); return;
     }
     const messages = await client.sessionMessages(lane.account, batch.sessionId, signal);
+    signal.throwIfAborted();
     if (messages.length) {
       this.verifyMessages(messages, batch); batch.phase = 'appended'; batch.uncertainReads = 0; this.save(lane);
     } else if (batch.phase === 'appending') {
@@ -299,21 +307,26 @@ export class OpenVikingIngestion {
     else {
       batch.phase = 'appending'; this.save(lane);
       await client.appendSources(lane.account, batch.sessionId, batch.sources.map(source => source.message), signal);
+    signal.throwIfAborted();
       this.verifyMessages(await client.sessionMessages(lane.account, batch.sessionId, signal), batch);
+    signal.throwIfAborted();
       batch.phase = 'appended'; batch.uncertainReads = 0; this.save(lane);
     }
     this.verifySources(lane);
     signal.throwIfAborted();
     batch.phase = 'committing'; batch.uncertainReads = 0; this.save(lane);
     const committed = object(await client.commitSession(lane.account, batch.sessionId, signal));
+    signal.throwIfAborted();
     if (committed.status !== 'accepted' || committed.archived !== true || typeof committed.task_id !== 'string'
       || committed.archive_uri !== `viking://user/group/sessions/${batch.sessionId}/history/archive_001`)
       throw new IngestionError('COMMIT_RECEIPT_INVALID', true);
     batch.taskId = committed.task_id; batch.archiveId = 'archive_001'; batch.phase = 'archived'; this.save(lane);
     const archive = await this.archive(lane, signal);
+    signal.throwIfAborted();
     if (archive) await this.reconcileArchive(lane, archive, signal); else this.pending(lane);
   }
   private async reconcileArchive(lane: Lane, archive: Record<string, any>, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
     const batch = lane.batch!, client = this.service(lane).client;
     if (archive.archive_id !== 'archive_001' || !['pending', 'failed', 'completed'].includes(archive.status)
       || typeof archive.messages_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(archive.messages_sha256)) throw new IngestionError('INVALID_ARCHIVE', true);
@@ -326,6 +339,7 @@ export class OpenVikingIngestion {
       lane.failures = 0; lane.retryAt = 0; lane.lastError = null; lane.blocked = false; this.save(lane); this.emit('completed', lane); return;
     }
     const tasks = await client.sessionTasks(lane.account, batch.sessionId, signal);
+    signal.throwIfAborted();
     if (!Array.isArray(tasks) || tasks.some(task => object(task).resource_id !== batch.sessionId)) throw new IngestionError('INVALID_TASK_RECEIPT', true);
     const active = tasks.find(task => ['pending', 'running', 'cancelling'].includes(task.status));
     if (active) { batch.taskId = String(active.task_id); batch.uncertainReads = 0; this.pending(lane); return; }
@@ -341,6 +355,7 @@ export class OpenVikingIngestion {
     }
     batch.archiveRetries++; this.save(lane);
     const recovered = object(await client.retrySessionArchive(lane.account, batch.sessionId, 'archive_001', archive.messages_sha256, signal));
+    signal.throwIfAborted();
     if (!['accepted', 'skipped'].includes(recovered.status)) throw new IngestionError('INVALID_RECOVERY_RECEIPT', true);
     if (typeof recovered.task_id === 'string') batch.taskId = recovered.task_id;
     lane.lastError = null; this.pending(lane);

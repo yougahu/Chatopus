@@ -70,9 +70,10 @@ export class SharedMemoryService {
     return '本会话允许的成员资料字段：'+JSON.stringify(this.fieldDefinitions(roomId))+'。仅可更新这些字段；本人清空全部当前资料时逐项clear；资料字段不授予工具或系统权限。';
   }
   account(roomId:string):string{return memoryAccountId(this.config.memory!.namespace,this.config.qq.selfId||'local',roomId);}
-  private async directory(accountId:string):Promise<void>{
+  private async directory(accountId:string,signal?:AbortSignal):Promise<void>{
+    signal?.throwIfAborted();
     let pending=this.readyDirectories.get(accountId);
-    if(!pending){pending=this.client.ensureMemberDirectory(accountId).catch(error=>{this.readyDirectories.delete(accountId);throw error;});this.readyDirectories.set(accountId,pending);}
+    if(!pending){pending=this.client.ensureMemberDirectory(accountId,signal).catch(error=>{this.readyDirectories.delete(accountId);throw error;});this.readyDirectories.set(accountId,pending);}
     await pending;
   }
   async readMember(roomId:string,memberId:string,signal?:AbortSignal):Promise<{document:MemberMemoryDocument;sha256:string}|null>{
@@ -106,18 +107,19 @@ export class SharedMemoryService {
   }
   /** Retrying a frozen CAS intent is safe even when the previous HTTP request is still running. */
   async applyMemberWrite(intent:MemberWriteIntent,signal?:AbortSignal):Promise<MemberMemoryDocument>{
+    signal?.throwIfAborted();
     if(intent.accountId!==this.account(intent.roomId)||intent.sha256!==sha(intent.text))throw new Error('Memory write intent identity mismatch');
     const desired=memberMemoryDocumentSchema.parse(JSON.parse(intent.text));
     if(desired.memberId!==intent.memberId||desired.commitId!==intent.commitId)throw new Error('Memory write intent content mismatch');
-    const before=await this.client.read(intent.accountId,memberMemoryUri(intent.memberId),signal);
+    const before=await this.client.read(intent.accountId,memberMemoryUri(intent.memberId),signal);signal?.throwIfAborted();
     if(before?.sha256===intent.sha256)return desired;
     if((before?.sha256??null)!==intent.expectedSha256)throw new OpenVikingError('CONFLICT',409,false);
-    await this.directory(intent.accountId);
+    await this.directory(intent.accountId,signal);signal?.throwIfAborted();
     let failure:unknown;
     try{await this.client.writeMember(intent.accountId,intent.memberId,intent.text,intent.expectedSha256,signal);}
     catch(error){failure=error;}
     // A queue failure or lost response can follow a successful content write.
-    const saved=await this.client.read(intent.accountId,memberMemoryUri(intent.memberId),signal);
+    signal?.throwIfAborted();const saved=await this.client.read(intent.accountId,memberMemoryUri(intent.memberId),signal);signal?.throwIfAborted();
     if(saved?.sha256===intent.sha256)return desired;
     if(failure)throw failure;
     throw new OpenVikingError('WRITE_NOT_VERIFIED',200,true);

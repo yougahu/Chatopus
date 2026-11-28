@@ -9,7 +9,7 @@ type FileMetadata = Pick<OutgoingFile, 'artifactId' | 'name' | 'bytes'>;
 /** Registers private immutable copies, so later edits cannot alter a selected delivery. */
 export class ReplyFiles {
   private files = new Map<string, OutgoingFile>();
-  constructor(private readonly workspace: string) {}
+  constructor(private readonly workspace: string,private readonly managed?:import('../attachments.js').ManagedFileWriter) {}
 
   async publish(root: string, relative: unknown, requestedName?: unknown, signal?: AbortSignal): Promise<FileMetadata & { note: string }> {
     signal?.throwIfAborted();
@@ -34,7 +34,8 @@ export class ReplyFiles {
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Invalid file output directory');
       const artifactId = `file-${randomUUID()}`; file = path.join(directory, artifactId);
       signal?.throwIfAborted();
-      await fs.writeFile(file, bytes, { flag: 'wx', mode: 0o400 });
+      if(this.managed)await this.managed.write(file,bytes,artifactId,signal);
+      else await fs.writeFile(file, bytes, { flag: 'wx', mode: 0o400 });
       signal?.throwIfAborted();
       const snapshot: OutgoingFile = { kind: 'file', artifactId, file, name, bytes: bytes.length, sha256 };
       await readOutgoingFile(snapshot, this.workspace);
@@ -49,7 +50,7 @@ export class ReplyFiles {
   }
 
   private metadata({ artifactId, name, bytes }: OutgoingFile): FileMetadata & { note: string } {
-    return { artifactId, name, bytes, note: 'Prepared for delivery, not uploaded yet. Select this artifactId in the final report files array. The host uploads selected files to the task group after accepting your report; do not claim upload success before a receipt.' };
+    return { artifactId, name, bytes, note: 'Prepared for delivery, not uploaded yet. Select this artifactId in the final report files array. The host uploads selected files to the task conversation after accepting your report; do not claim upload success before a receipt.' };
   }
 
   async resolve(ids: string[]): Promise<OutgoingFile[]> {

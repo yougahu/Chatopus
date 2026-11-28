@@ -27,6 +27,19 @@ function task(store: Store, id = 'one') {
   return store.createThread(message, '资料整理', true);
 }
 
+it('bounds the overview task preview without changing full-list pagination or usage totals', async () => {
+  const { store, get } = await setup();
+  for (let i = 0; i < 12; i++) {
+    const thread = task(store, 'preview-' + i); thread.updatedAt = i + 1; store.saveThread(thread);
+    store.telemetry('model', { role: 'worker', threadId: thread.id, inputTokens: 5, outputTokens: 2 });
+  }
+  const all = await get('/api/threads'), preview = await get('/api/threads?limit=6');
+  expect(all).toHaveLength(12); expect(preview).toEqual(all.slice(0, 6));
+  expect(await get('/api/threads?limit=6&offset=6')).toEqual(all.slice(6));
+  expect(await get('/api/threads?limit=1000000')).toEqual(all);
+  expect(await get('/api/threads?limit=invalid')).toEqual(all);
+});
+
 it('sums task Worker executions and repairs once, includes cache, and distinguishes unrecorded runs', async () => {
   const { store, get } = await setup(), t = task(store), other = task(store, 'other');
   store.saveRun('run-one', t.id, 'succeeded', {});

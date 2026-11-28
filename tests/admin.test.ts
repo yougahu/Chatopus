@@ -222,3 +222,29 @@ it('separates routine continuation events from alerts and exposes delivery attem
  const detail=await(await fetch(url+'/api/threads/t')).json();expect(detail.outbox).toHaveLength(1);
  expect(detail.lifecycleEvents.some((event:any)=>event.kind==='run_superseded')).toBe(true);
 });
+
+describe('private conversation administration',()=>{
+ it('saves the four settings with revision checking without claiming service application',async()=>{
+  const f=await setup();writeFileSync(join(f.config.root,'config.local.json'),JSON.stringify({qq:{selfId:'900',allowedGroupIds:['100']},custom:{keep:true}}));
+  const before=await (await fetch(f.url+'/api/config')).json();expect(before.privateChatStatus.settings.enabled).toBe(false);
+  const body={revision:before.privateChatStatus.revision,settings:{enabled:true,allowedUserIds:['901'],maxMessagesPerMinute:20,replyMode:'plain'}};
+  const response=await fetch(f.url+'/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}),saved=await response.json();
+  expect(response.status).toBe(200);expect(saved.saved).toBe(true);expect(saved.applied).toBeNull();expect(saved.running).toBe(false);
+  expect(JSON.parse(readFileSync(join(f.config.root,'config.local.json'),'utf8'))).toMatchObject({custom:{keep:true},qq:{allowedGroupIds:['100'],privateChat:body.settings}});
+  expect((await fetch(f.url+'/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})).status).toBe(409);
+ });
+ it('shows invalid disk configuration while retaining the last application evidence',async()=>{
+  const f=await setup();f.store.telemetry('private_config_applied',{digest:'old',settings:{enabled:false},appliedAt:123});writeFileSync(join(f.config.root,'config.local.json'),'{ invalid');
+  const response=await fetch(f.url+'/api/config'),value=await response.json();expect(response.status).toBe(200);expect(value.privateChatStatus.applied.digest).toBe('old');expect(value.privateChatStatus.error.code).toBe('private_config_invalid');
+ });
+ it('filters private messages before pagination and keeps full room identities',async()=>{
+  const f=await setup();for(let i=0;i<120;i++)f.store.ingest({id:'m'+i,roomId:i<105?'qq:900:100':'qq:900:private:100',platform:'qq',messageId:String(i),authorId:'100',authorName:'Member',text:'hello',timestamp:i,mentions:[],attachments:[],isMentioned:false,isAdmin:false});
+  const privateRows=await (await fetch(f.url+'/api/messages?kind=private&offset=10')).json();expect(privateRows).toHaveLength(5);expect(privateRows.every((r:any)=>r.room==='qq:900:private:100')).toBe(true);
+  const groups=await (await fetch(f.url+'/api/messages?kind=group&offset=100')).json();expect(groups).toHaveLength(5);expect(groups.every((r:any)=>r.room==='qq:900:100')).toBe(true);
+ });
+ it('resolves delivery uncertainty through the shared transaction without rewriting platform facts',async()=>{
+  const f=await setup();const id=f.store.enqueue({roomId:'room',text:'result'},{id:'uncertain',status:'unknown'});
+  const response=await fetch(f.url+'/api/deliveries/resolve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({outboxId:id,decision:'received',expectedResolutionVersion:0,key:'admin-resolution'})});
+  expect(response.status).toBe(200);expect((await response.json()).closed).toBe(true);expect(f.store.outbox()[0]).toMatchObject({status:'unknown',deliveryResolutions:[{reason:'confirmed_received',actor:{kind:'admin',id:'local-admin'}}]});
+ });
+});

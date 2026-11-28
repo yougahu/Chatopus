@@ -623,3 +623,48 @@ describe('scheduled execution through the Coordinator', () => {
     expect(scheduleSends(f)).toHaveLength(0);
   });
 });
+
+describe('private personal schedules',()=>{
+ function privateFixture(){
+  const f=fixture(),roomId='qq:100:private:301';
+  f.config.qq.privateChat={enabled:true,allowedUserIds:['301'],replyMode:'plain',maxMessagesPerMinute:30};f.coordinator.privateAccess.apply(f.config.qq.privateChat,[],()=>{});
+  f.service.updatePolicy(ADMIN,[],f.service.readPolicy().version);
+  const own={...actor(),roomId,accessKind:'private' as const,roleGroup:'unknown' as const};
+  const input=(id:string,text='continue')=>message(id,{id:roomId+':'+id,roomId,text,isMentioned:false,mentions:[],memberRoleGroup:'unknown'});
+  return {...f,roomId,own,input};
+ }
+ it('permits owner controls without granting group roles and rejects other peers',()=>{
+  const f=privateFixture(),plan=f.service.create(f.own,task({roomId:f.roomId}),'private');
+  const run=f.service.dispatchDue((run,s)=>({threadId:f.store.createScheduledThread(run,s).id}),Date.now()+1000)[0];
+  const thread=f.store.thread(run.threadId!)!;
+  expect(f.coordinator.scheduledTasks.assertThreadControl(f.input('control'),thread)?.id).toBe(plan.id);
+  expect(()=>f.coordinator.scheduledTasks.assertThreadControl({...f.input('other'),authorId:'302'},thread)).toThrow();expect(f.publisher.roleCalls).toEqual([]);
+ });
+ it('freezes the delivery deadline and drops a reminder after an offline wait',async()=>{
+  const f=privateFixture();f.publisher.deferred=true;
+  const plan=f.service.create(f.own,task({roomId:f.roomId,executionKind:'reminder',catchUpWindowMs:1000}),'expires');
+  f.advance();await f.coordinator.tick();const run=f.service.runs(ADMIN,plan.id).items[0],row=f.store.outbox().find(x=>x.scheduleRunId===run.id)!;
+  expect(row.deliveryExpiresAt).toBe(run.scheduledAt+1000);f.advance(6000);f.publisher.deferred=false;await f.coordinator.tick();
+  expect(f.store.outbox().find(x=>x.id===row.id)).toMatchObject({status:'stale',reason:'delivery_expired',deliveryExpiresAt:run.deliveryExpiresAt});expect(scheduleSends(f)).toHaveLength(0);
+ });
+ it('keeps completed worker results while refusing delivery after their original deadline',async()=>{
+  const f=privateFixture(),plan=f.service.create(f.own,task({roomId:f.roomId,catchUpWindowMs:1000}),'slow');
+  f.advance();await f.coordinator.tick();await until(()=>f.runtime.workers.length===1,f.coordinator);f.advance(6000);f.runtime.complete(0);
+  await until(()=>f.store.outbox().some(row=>row.scheduleRunId&&row.status==='stale'),f.coordinator);
+  const run=f.service.runs(ADMIN,plan.id).items[0];expect(run.status).toBe('succeeded');expect(run.resultId).toBeTruthy();expect(scheduleSends(f)).toHaveLength(0);
+ });
+ it('creates one ordinary follow-up with original conditions and keeps a needs-input plan paused',async()=>{
+  const f=privateFixture(),plan=f.service.create(f.own,task({roomId:f.roomId,scheduleSpec:{kind:'interval',anchorAt:Date.now()+1000,intervalMs:HOUR_MS}}),'follow');
+  f.advance();await f.coordinator.tick();await finish(f,0,{status:'needs_input',shortAnswer:'Which period?'});
+  const thread=f.runtime.workers[0].thread,reply=f.store.outbox().find(row=>row.scheduleRunId===thread.scheduledTask!.scheduleRunId)!;
+  f.runtime.decide=request=>[{action:'append_thread',threadId:thread.id,sourceMessageIds:[request.messages[0].id],kind:'supplement',resolvedRequest:'Use last week.'}];
+  const source={...f.input('supplement','Use last week.'),replyToMessageId:reply.platformMessageId};await f.coordinator.receive(source);await f.coordinator.receive(source);
+  await until(()=>f.runtime.workers.length===2,f.coordinator);const follow=f.runtime.workers[1];expect(follow.thread.followupOf?.scheduleId).toBe(plan.id);expect(follow.inputs[0].routingContext?.resolvedRequest).toContain('Summarize the saved notes.');
+  expect(f.service.get(ADMIN,plan.id).status).toBe('paused');expect(f.service.runs(ADMIN,plan.id).total).toBe(1);expect(f.store.thread(thread.id)?.revision).toBe(1);
+ });
+ it('defers transient friend verification and blocks a confirmed missing friend',async()=>{
+  const f=privateFixture();let mode='transient';(f.publisher as any).verifyFriend=async()=>{if(mode==='transient')throw new Error('offline');return mode==='friend';};
+  const plan=f.service.create(f.own,task({roomId:f.roomId}),'friend');f.advance();await f.coordinator.tick();await new Promise(r=>setTimeout(r,5));expect(f.runtime.workers).toHaveLength(0);expect(f.service.get(ADMIN,plan.id).stateReason).toBeUndefined();
+  mode='missing';f.advance(5000);await f.coordinator.tick();await until(()=>f.service.get(ADMIN,plan.id).stateReason==='friend_unavailable');expect(f.runtime.workers).toHaveLength(0);
+ });
+});

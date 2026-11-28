@@ -1,3 +1,4 @@
+import type {ManagedFileWriter} from '../attachments.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -10,7 +11,7 @@ const extensions = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'web
 /** A run can publish only screenshots whose bytes this registry received. */
 export class ReplyImages {
   private images = new Map<string, OutgoingImage>();
-  constructor(private readonly workspace: string) {}
+  constructor(private readonly workspace: string,private readonly managedWriter?:ManagedFileWriter) {}
 
   async capture(result: unknown): Promise<unknown> {
     if (!result || typeof result !== 'object') return result;
@@ -44,7 +45,7 @@ export class ReplyImages {
         for (const { bytes, mimeType } of decoded) {
           const artifactId = `image-${randomUUID()}`;
           const file = path.join(directory, `${artifactId}.${extensions[mimeType]}`);
-          await fs.writeFile(file, bytes, { flag: 'wx', mode: 0o600 });
+          if(this.managedWriter)await this.managedWriter.write(file,bytes,artifactId);else await fs.writeFile(file, bytes, { flag: 'wx', mode: 0o600 });
           prepared.push({ kind: 'image', artifactId, file, mimeType, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
         }
       } catch (error) {

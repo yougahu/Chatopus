@@ -59,7 +59,7 @@ it('preflights all files before any upload and does not publish a success reply 
   const f=fixture(),first=f.file('translation.md'),second=f.file('data.csv');writeFileSync(second.file,'changed');f.queue([first,second]);
   for(let i=0;i<3;i++){f.due();await f.coordinator.tick();}
   expect(f.publisher.uploads).toEqual([]);expect(f.row().status).toBe('failed');await f.coordinator.tick();
-  expect(f.publisher.messages).toHaveLength(1);expect(f.publisher.messages[0].message.text).toContain('未能上传到群');expect(f.publisher.messages[0].message.text).not.toContain(f.root);
+  expect(f.publisher.messages).toHaveLength(1);expect(f.publisher.messages[0].message.text).toContain('未能上传到会话');expect(f.publisher.messages[0].message.text).not.toContain(f.root);
 });
 it('preserves confirmed uploads across a retry and process restart',async()=>{
   const f=fixture();f.queue([f.file('one.md'),f.file('two.md')]);let failed=false;
@@ -126,7 +126,7 @@ it('does not silently drop files when a publisher has no upload capability',asyn
   const f=fixture();(f.publisher as any).uploadFile=undefined;f.queue([f.file('translation.md')]);
   for(let i=0;i<3;i++){f.due();await f.coordinator.tick();}
   expect(f.row()).toMatchObject({status:'failed',reason:'file_upload_unavailable'});await f.coordinator.tick();
-  expect(f.publisher.messages[0].message.text).toContain('没有可用的群文件上传接口');
+  expect(f.publisher.messages[0].message.text).toContain('没有可用的文件上传接口');
 });
 it('rejects excessive combined file bytes before attempting uploads',async()=>{
   const f=fixture(),first=f.file('one.md');f.queue([1,2,3].map(index=>({...first,artifactId:'file-'+index,name:index+'.md',bytes:8*1024*1024})));
@@ -146,4 +146,15 @@ it('pauses between confirmed files for an unresolved quote and resumes without r
  expect(events).toEqual(expect.arrayContaining([expect.objectContaining({status:'sent',part:'one.md'}),expect.objectContaining({status:'deferred',reason:'related_input_unresolved'})]));
  f.store.messageStatus(update.id,'routed');f.due();await f.coordinator.tick();
  expect(f.row().status).toBe('sent');expect(f.publisher.uploads.map(item=>item.file.name)).toEqual(['one.md','two.md']);expect(f.publisher.messages).toHaveLength(1);
+});
+
+it('expires the unsent tail between file uploads while preserving the first confirmed receipt',async()=>{
+ const f=fixture();f.queue([f.file('first.txt'),f.file('second.txt')]);
+ const row=f.row();row.deliveryExpiresAt=Date.now()+60000;f.store.saveOutbox(row);
+ f.publisher.onUpload=async file=>{const now=f.row();now.deliveryExpiresAt=Date.now()-1;f.store.saveOutbox(now);return {status:'sent',platformFileId:'qq-'+file.artifactId};};
+ // Move the clock past the immutable cutoff while the first operation is in flight.
+ const original=Date.now;let expired=false;Date.now=()=>original()+(expired?120000:0);
+ f.publisher.onUpload=async file=>{expired=true;return {status:'sent',platformFileId:'qq-'+file.artifactId};};
+ try{await f.coordinator.tick();}finally{Date.now=original;}
+ expect(f.publisher.uploads).toHaveLength(1);expect(f.publisher.messages).toHaveLength(0);expect(f.row()).toMatchObject({status:'stale',reason:'delivery_expired'});expect(f.row().fileDeliveries?.[0].status).toBe('sent');expect(f.row().fileDeliveries?.[1].status).toBe('pending');
 });

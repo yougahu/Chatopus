@@ -1,3 +1,6 @@
+import {conversationInstructions,isPrivateRoom} from './conversation.js';
+import { prepareIncomingImages, type IncomingImageContext, type IncomingImageEvent } from './runtime/incoming-images.js';
+export type { IncomingImageContext, IncomingImageEvent } from './runtime/incoming-images.js';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { enforceExplicitActivation, hasWakeCandidate, silentMessages } from './activation.js';
@@ -31,11 +34,9 @@ import { parseRoutesForRequest, parseReport, ROUTER_PROMPT, WORKER_PROMPT, ROUTE
 import type { Attachment, GroupMessage, RouteAction, RouterRequest, RuntimePort, ThreadInput, WorkerRequest,RouterContextReader,RouterExecution,ToolDefinition } from './types.js';
 
 export interface RuntimeMetrics extends Pick<NativeMeasurement,'status'|'code'|'usageStatus'|'modelCalls'|'missingUsageCalls'|'measurementId'|'steps'> { threadId?:string;runId?:string;role:'router'|'worker'|'memory'; sessionId:string; elapsedMs:number; inputTokens:number; outputTokens:number;cacheReadTokens?:number;cacheWriteTokens?:number; compaction?:NativeResult['compaction'];outputNormalizations?:number;promptHash?:string;toolsHash?:string;phase?:'initial'|'repair';queueMs?:number;setupMs?:number }
-export interface IncomingImageContext { threadId:string; runId:string; roomId:string; messageId:string; attachmentIndex:number; phase:'start'|'steer' }
-export interface IncomingImageEvent extends IncomingImageContext { status:'loaded'|'failed'|'omitted'; code?:string; bytes?:number }
 export interface DshOptions {
   sharedMemory?:SharedMemoryService;
-  resolveImage?: (attachment:Attachment,context:IncomingImageContext)=>Promise<Attachment>;
+  resolveImage?: (attachment:Attachment,context:IncomingImageContext,signal?:AbortSignal)=>Promise<Attachment>;
   onImage?:(event:IncomingImageEvent)=>void;
   onMetrics?:(metrics:RuntimeMetrics)=>void;
   onModelCall?:(call:NativeModelCall & {role:RuntimeMetrics['role'];threadId?:string;runId?:string;revision?:number})=>void;
@@ -51,7 +52,7 @@ export function routerSessionId(roomId:string):string {
 }
 function compactMessage(m:GroupMessage,limit=4000){
   return {...m,text:m.text.slice(0,limit),...(m.text.length>limit?{textTruncated:true}:{}),
-    attachments:m.attachments.map((a,attachmentIndex)=>({kind:a.kind,hasImage:true,attachmentIndex})),mentions:m.mentions.slice(0,12)};
+    attachments:m.attachments.map((a,attachmentIndex)=>({kind:a.kind,hasImage:a.kind==='image',attachmentIndex,...(a.kind==='file'?{attachmentId:a.attachmentId,name:a.name,bytes:a.bytes,downloadError:a.downloadError}:{})})),mentions:m.mentions.slice(0,12)};
 }
 function compactInput(input:ThreadInput){
   return {...input,message:compactMessage(input.message,Number.MAX_SAFE_INTEGER),
@@ -59,7 +60,7 @@ function compactInput(input:ThreadInput){
 }
 /** Single current snapshot; the explicit capacity is supplied by the resolved model. */
 export const routerPayload=buildRouterPayload;
-const routerSystemPrompt=(config:Config,recall:boolean,roomId='')=>[ROUTER_PROMPT,roomId.startsWith('qq:')?QQ_TEXT_FORMAT:'',businessPrompt(resolveBusinessProfile(config,roomId),'router')].filter(Boolean).join('\n\n')+'\n本地配置的机器人称呼：'+JSON.stringify(config.botCallNames)+'。只在当前正文中直接呼唤这些称呼才算唤起；提及、转述或引用中的称呼不算。'+(recall?'\n'+ROUTER_RECALL_INSTRUCTION:'');
+const routerSystemPrompt=(config:Config,recall:boolean,roomId='')=>[ROUTER_PROMPT,roomId.startsWith('qq:')?QQ_TEXT_FORMAT:'',businessPrompt(resolveBusinessProfile(config,roomId),'router'),conversationInstructions(roomId)].filter(Boolean).join('\n\n')+(isPrivateRoom(roomId)?'':'\n本地配置的机器人称呼：'+JSON.stringify(config.botCallNames)+'。只在当前正文中直接呼唤这些称呼才算唤起；提及、转述或引用中的称呼不算。')+(recall?'\n'+ROUTER_RECALL_INSTRUCTION:'');
 
 /** Diagnostics are optional; a recovery must never make a full current input overflow. */
 export function routerRecoveryPayload(request:RouterRequest,config:Pick<Config,'recentMessageLimit'|'threadCardLimit'>,payload:string,inputBudget:number,
@@ -250,46 +251,22 @@ export class DshRuntime implements RuntimePort {
   private modelObserver(role:RuntimeMetrics['role'],extra:{threadId?:string;runId?:string;revision?:number}={}){
     return (call:NativeModelCall)=>{try{this.options.onModelCall?.({...call,role,...extra});}catch{/* observation only */}};
   }
-  private imageEvent(event:IncomingImageEvent){try{this.options.onImage?.(event);}catch{/* observer only */}}
-  private async prepareImages(request:WorkerRequest,inputs:ThreadInput[],phase:IncomingImageContext['phase'],signal?:AbortSignal){
-    const images:NativeImage[]=[],imageAttachments:Array<{messageId:string;attachmentIndex:number}>=[];
-    const attachmentErrors:Array<{messageId:string;attachmentIndex:number;code:string}>=[];
-    const attachmentOmissions:Array<{messageId:string;attachmentIndex:number;reason:string}>=[];
-    const seen=new Set<string>();
-    const selected:Array<{message:GroupMessage;attachment:Attachment;index:number;order:number}>=[];
-    // Select recent input first, including its explicitly associated old images.
-    // Send the selection in input order so model image-to-message mapping stays explicit.
-    for(let i=inputs.length-1;i>=0;i--){
-      const input=inputs[i],messages=[...(input.contextMessages??[]),input.message];
-      for(let m=messages.length-1;m>=0;m--)for(const [index,attachment]of messages[m].attachments.entries()){
-        const message=messages[m],key=JSON.stringify([message.roomId,message.id,index]);
-        if(seen.has(key))continue;seen.add(key);
-        const context={threadId:request.thread.id,runId:request.runId,roomId:message.roomId,messageId:message.id,attachmentIndex:index,phase};
-        if(selected.length>=4){attachmentOmissions.push({messageId:message.id,attachmentIndex:index,reason:'image_limit'});this.imageEvent({...context,status:'omitted',code:'image_limit'});continue;}
-        selected.push({message,attachment,index,order:i*1_000_000+m*1000+index});
-      }
-    }
-    for(const {message,attachment,index}of selected.sort((a,b)=>a.order-b.order)){
-      signal?.throwIfAborted();
-      const context:IncomingImageContext={threadId:request.thread.id,runId:request.runId,roomId:message.roomId,messageId:message.id,attachmentIndex:index,phase};
-      try{
-        const resolved=attachment.url?.startsWith('data:')?attachment:await this.options.resolveImage?.(attachment,context);
-        if(!resolved?.url?.startsWith('data:image/'))throw new Error('image_data_unavailable');
-        const match=resolved.url.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/);
-        if(!match)throw new Error('invalid_image_encoding');
-        if(match[2].length>14_000_000)throw new Error('image_too_large');
-        const data=Buffer.from(match[2],'base64');if(data.length>10*1024*1024)throw new Error('image_too_large');
-        images.push({data,mediaType:match[1] as NativeImage['mediaType'],name:`${message.id}:${index}`});
-        imageAttachments.push({messageId:message.id,attachmentIndex:index});
-        this.imageEvent({...context,status:'loaded',bytes:data.length});
-      }catch(error){
-        const candidate=(error as {code?:unknown})?.code??(error instanceof Error?error.message:'');
-        const code=typeof candidate==='string'&&/^[a-z][a-z0-9_]{1,63}$/.test(candidate)?candidate:'image_load_failed';
-        attachmentErrors.push({messageId:message.id,attachmentIndex:index,code});this.imageEvent({...context,status:'failed',code});
-      }
-    }
-    signal?.throwIfAborted();
-    return {images,imageAttachments,attachmentErrors,attachmentOmissions};
+  private prepareImages(request:WorkerRequest,inputs:ThreadInput[],phase:'start'|'steer',signal?:AbortSignal){
+    return prepareIncomingImages(inputs.map(input=>[...(input.contextMessages??[]),input.message]),
+      {role:'worker',threadId:request.thread.id,runId:request.runId,roomId:request.thread.roomId,phase},this.options.resolveImage,this.options.onImage,signal);
+  }
+  private prepareRouterImages(request:RouterRequest,originals:RouterRequest,config:Config,signal:AbortSignal){
+    const current=request.event==='messages'?request.messages.filter(message=>hasWakeCandidate(message,config.botCallNames)):[];
+    const quoted=current.flatMap(message=>{
+      const reference=request.references?.[message.id];
+      const original=reference?.message??request.recentMessages.find(candidate=>candidate.messageId===message.replyToMessageId);
+      return original?[original]:[];
+    });
+    // Raw bytes/URLs stay in host originals; persistent requests contain only markers.
+    const originalById=new Map([...originals.recentMessages,...Object.values(originals.references??{}).flatMap(ref=>ref.message?[ref.message]:[]),...originals.messages].map(message=>[message.id,message]));
+    const restore=(message:GroupMessage)=>originalById.get(message.id)??message;
+    return prepareIncomingImages([quoted.map(restore),current.map(restore)],
+      {role:'router',roomId:request.roomId,routeTurnId:request.routing?.routeTurnId,phase:'route'},this.options.resolveImage,this.options.onImage,signal);
   }
   private async structured<T>(agent:NativeAgent,role:'router'|'worker',payload:string,parse:(text:string)=>T,images:NativeImage[]=[],timing?:{enqueuedAt:number;turnStartedAt:number;threadId?:string;runId?:string},recalledContext?:()=>unknown):Promise<T>{
     const started=Date.now();
@@ -344,11 +321,23 @@ export class DshRuntime implements RuntimePort {
       const {context}=await this.routerLimits(config,lease,execution?.signal??abort.signal);
       const workingContext=Math.min(resolveRouterCompactionSettings(config.routerCompaction).contextTokens??context,context);
       const inputBudget=await this.contextBudget(config,request.roomId,memory,execution?.signal??abort.signal);
-      const payload=request.routing?JSON.stringify({...request,routing:{...request.routing,repair:undefined},result:request.result?{...request.result,report:{...request.result.report,details:undefined,attachments:undefined,fileAttachments:undefined,requirementState:undefined,requirementSnapshot:undefined,hostMemberMemory:undefined}}:undefined}):routerPayload(request,config,Boolean(readContext),inputBudget);
+      let payload=request.routing?JSON.stringify({...request,routing:{...request.routing,repair:undefined},result:request.result?{...request.result,report:{...request.result.report,details:undefined,attachments:undefined,fileAttachments:undefined,requirementState:undefined,requirementSnapshot:undefined,hostMemberMemory:undefined}}:undefined}):routerPayload(request,config,Boolean(readContext),inputBudget);
       if(Buffer.byteLength(payload)>inputBudget)throw Object.assign(new Error('Prepared Router input exceeds capacity'),{code:'ROUTER_PAYLOAD_OVERSIZED'});
-      const supplied=JSON.parse(payload) as RouterRequest;
+      let supplied=JSON.parse(payload) as RouterRequest;
+      const imageSignal=AbortSignal.any([abort.signal,AbortSignal.timeout(Math.max(1,(config.routerTurnTimeoutMs??120_000)-(Date.now()-turnStartedAt))),...(execution?[execution.signal]:[])]);
+      const {images,...imageStatus}=await untilRouterAbort(imageSignal,()=>this.prepareRouterImages(supplied,request,config,imageSignal));
+      const hasImages=images.length||imageStatus.attachmentErrors.length||imageStatus.attachmentOmissions.length;
+      if(hasImages){
+        supplied={...supplied,...imageStatus};payload=JSON.stringify(supplied);
+        if(Buffer.byteLength(payload)>inputBudget)throw Object.assign(new Error('Router image manifest exceeds capacity'),{code:'ROUTER_PAYLOAD_OVERSIZED'});
+      }
       let previousOutput=request.routing?.repair?.previousOutput,validationError=request.routing?.repair?.validationError;
-      const recall=readContext?createRouterRecall(supplied,readContext):undefined;
+      const recall=readContext?createRouterRecall(supplied,readContext,async(messages,signal)=>{
+        const authors=new Set(supplied.messages.filter(message=>hasWakeCandidate(message,config.botCallNames)).map(message=>message.authorId));
+        const quoted=new Set(supplied.messages.map(message=>message.replyToMessageId).filter(Boolean));
+        return prepareIncomingImages([messages.filter(message=>authors.has(message.authorId)||quoted.has(message.messageId))],
+          {role:'router',roomId:supplied.roomId,routeTurnId:supplied.routing?.routeTurnId,phase:'route'},this.options.resolveImage,this.options.onImage,signal);
+      }):undefined;
       const memoryTool=memory?.createReadTool(request.roomId,request.messages.map(message=>message.authorId));
       // Persistent generations are owned by the Coordinator. Uncertain native state must be
       // discarded there before retrying; never start a second physical session behind its pointer.
@@ -376,8 +365,8 @@ export class DshRuntime implements RuntimePort {
           const validationRepairs=request.routing?(recall||memoryTool||taskTools.length?2:1):0;
           for(let correction=0;;correction++){
             const repairing=Boolean(attempt||request.routing?.repair||correction);
-            const sendPayload=repairing?routerRecoveryPayload(request,config,payload,inputBudget,previousOutput,validationError,recall?.repairContext()):payload;
-            const started=Date.now(),result=await this.measuredSend(agent,'router',sendPayload,[],{continueBudget:correction>0},{phase:repairing?'repair':'initial',...(!repairing?{queueMs:turnStartedAt-enqueuedAt,setupMs:started-turnStartedAt}:{})});
+            const sendPayload=repairing?routerRecoveryPayload({...request,...(hasImages?imageStatus:{})},config,payload,inputBudget,previousOutput,validationError,recall?.repairContext()):payload;
+            const started=Date.now(),result=await this.measuredSend(agent,'router',sendPayload,images,{continueBudget:correction>0},{phase:repairing?'repair':'initial',...(!repairing?{queueMs:turnStartedAt-enqueuedAt,setupMs:started-turnStartedAt}:{})});
             try{const actions=parseRoutesForRequest(result.text,supplied);validateRoutingExtensions(actions,extensions);recall?.assertComplete(actions);return enforceExplicitActivation(actions,supplied.messages,config.botCallNames);}
             catch(error){
               previousOutput=result.text;const failure=this.safeError(error,config);validationError=failure.message;
@@ -430,7 +419,7 @@ export class DshRuntime implements RuntimePort {
       const inputs=workerContext.inputs;
       lease=await this.acquire('worker',config);signal.throwIfAborted();
       domain=await (this.options.capabilityFactory??createCapabilitySession)(this.capabilityConfig(config),{
-        threadId:request.thread.id,runId:request.runId,revision:request.thread.revision,workspace:request.workspace,
+        threadId:request.thread.id,runId:request.runId,revision:request.thread.revision,workspace:request.workspace,attachmentWriter:request.attachmentWriter,
         artifactWorkspace:join(config.stateDir,'workspaces',request.thread.id,'.artifacts'),historyWorkspace:join(config.stateDir,'workspaces',request.thread.id),
         execution:request.scheduledInput?{kind:'scheduled',authority:request.scheduledInput.authority,scheduleId:request.scheduledInput.scheduleId,scheduleRunId:request.scheduledInput.scheduleRunId}:undefined,
         question:currentTaskQuestion(request.inputs,request.scheduledInput),routingMetadata:request.inputs.at(-1)?.routingContext?.routingMetadata,signal});
@@ -439,7 +428,7 @@ export class DshRuntime implements RuntimePort {
       const memoryMembers=request.scheduledInput?.authority==='system'?[]:[...new Set([request.scheduledInput?.ownerId??request.thread.ownerId,...request.inputs.slice().reverse().map(input=>input.message.authorId),...request.thread.participants])].filter(Boolean).slice(0,20);
       const memberMemory=memory&&memoryMembers.length?await memory.project(request.thread.roomId,memoryMembers):undefined;
       const memoryTool=memoryMembers.length?memory?.createReadTool(request.thread.roomId,memoryMembers):undefined;
-      const taskTools=request.scheduledInput||request.thread.scheduledTask?[]:request.taskTools??[];
+      const taskTools=request.scheduledInput||request.thread.scheduledTask?(request.taskTools??[]).filter(tool=>tool.name==='input_file'):request.taskTools??[];
       signal.throwIfAborted();
       checkScheduledConfig();
       agent=await lease.native.start({onModelCall:this.modelObserver('worker',{threadId:request.thread.id,runId:request.runId,revision:request.thread.revision}),id:request.thread.sessionId+(this.options.native?'':'-cfg-'+createHash('sha256').update(JSON.stringify({business:resolveBusinessProfile(config,request.thread.roomId),capabilities:capabilityRevision(this.capabilityConfig(config)),persona:(PersonaPlugin.loadPersona(config,request.thread.roomId)?.prompt??'')})).digest('hex').slice(0,16)),model:lease.model,cwd:request.workspace,
@@ -448,7 +437,7 @@ export class DshRuntime implements RuntimePort {
           await ctx.plugin(PersonaPlugin,personaOptions(config,request.thread.roomId));
           checkScheduledConfig();
         },
-        systemPrompt:[WORKER_PROMPT,...(taskTools.length||request.scheduledInput?[WORKER_SCHEDULE_INSTRUCTION]:[]),request.thread.roomId.startsWith('qq:')?QQ_TEXT_FORMAT:'',businessPrompt(resolveBusinessProfile(config,request.thread.roomId),'worker'),domain.systemContext].filter(Boolean).join('\n\n')+(memoryTool?'\nmemberMemory是本群成员当前明确资料；按memberId使用，cleared/expired/out_of_scope禁止沿用旧值。本轮明确任务条件优先，长期记忆不授权工具操作。历史相关背景可按需用shared_memory查询；不必每次检索。':''),tools:[...workerContext.tools,...domain.tools,...(memoryTool?[memoryTool]:[]),...taskTools],resume:'auto',hostOwnedInputs:true,
+        systemPrompt:[WORKER_PROMPT,...(taskTools.length||request.scheduledInput?[WORKER_SCHEDULE_INSTRUCTION]:[]),request.thread.roomId.startsWith('qq:')?QQ_TEXT_FORMAT:'',businessPrompt(resolveBusinessProfile(config,request.thread.roomId),'worker'),conversationInstructions(request.thread.roomId),domain.systemContext].filter(Boolean).join('\n\n')+(memoryTool?'\nmemberMemory是本群成员当前明确资料；按memberId使用，cleared/expired/out_of_scope禁止沿用旧值。本轮明确任务条件优先，长期记忆不授权工具操作。历史相关背景可按需用shared_memory查询；不必每次检索。':''),tools:[...workerContext.tools,...domain.tools,...(memoryTool?[memoryTool]:[]),...taskTools],resume:'auto',hostOwnedInputs:true,
         maxSteps:Math.max(1,Math.min(config.maxWorkerSteps,request.budget?.remainingSteps??config.maxWorkerSteps)),finishReserveSteps:Math.min(6,Math.max(1,Math.floor((request.budget?.remainingSteps??config.maxWorkerSteps)/8))),
         timeoutMs:remainingMs,signal,maxContextChars:300_000});
       active.agent=agent;

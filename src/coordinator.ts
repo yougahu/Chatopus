@@ -1,3 +1,8 @@
+import {deliveryText,threadDeliveryStatus,DeliveryService,deliveryParts} from './delivery-resolution.js';
+import {AttachmentService,prepareFileMetadata} from './attachments.js';
+import {isPrivateRoom,parseQqRoomId} from './conversation.js';
+import {PrivateChatAccess,qqStartupDigest,type AccessLease} from './private-chat.js';
+import {privateControl,runPrivateControl} from './private-controls.js';
 import {scheduleWorkerInputs,workerInputScheduling} from './worker-input-scheduling.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
@@ -47,10 +52,23 @@ export class Coordinator {
   readonly persistentRouter?:PersistentRouterManager;
   readonly memoryIngestion?:OpenVikingIngestion;
   readonly scheduledTasks:ScheduledTaskHost;
+  readonly privateAccess:PrivateChatAccess;
+  readonly attachments:AttachmentService;
+  readonly deliveries:DeliveryService;
   private lastWorkerWasScheduled=false;
+  private friendRetryAt=new Map<string,number>();
   constructor(readonly config:Config,readonly store:Store,readonly runtime:RuntimePort,readonly publisher:PublisherPort,readonly scheduleExecution=false){
-    this.scheduledTasks=new ScheduledTaskHost(config,store,publisher);
-    if(runtime.sharedMemory)this.memoryIngestion=new OpenVikingIngestion({db:store.db,sharedMemory:runtime.sharedMemory,source:store.roomMemory,
+    this.privateAccess=publisher.privateAccess??new PrivateChatAccess(config.qq.selfId,config.qq.privateChat);
+    store.privateAccess=this.privateAccess;
+    this.attachments=new AttachmentService(config,store,undefined,publisher.privateFileUrl?.bind(publisher));
+    this.scheduledTasks=new ScheduledTaskHost(config,store,publisher,this.privateAccess,this.attachments);
+    this.deliveries=new DeliveryService(store,this.scheduledTasks.service,join(config.stateDir,'workspaces'));
+    this.scheduledTasks.service.deliveryOutstanding=id=>this.deliveries.outstanding(id);
+    publisher.setDeliveryGuard?.((key,roomId)=>{
+      const row=store.outbox().find(row=>row.id===key||row.message.files?.some(file=>key===row.id+':file:'+file.artifactId));
+      return !!row&&row.message.roomId===roomId&&row.status==='sending'&&this.deliveryCurrent(row);
+    });
+    if(runtime.sharedMemory)this.memoryIngestion=new OpenVikingIngestion({access:room=>this.roomAllowed(room)?this.captureAccess(room)?.signal:false,db:store.db,sharedMemory:runtime.sharedMemory,source:store.roomMemory,
       concurrency:Math.max(1,config.concurrency-1),batchSize:config.memory?.ingestBatchSize,batchWindowMs:config.memory?.ingestBatchWindowMs,
       prepareAfter:()=>openVikingPrepareAfter(config.stateDir),
       onEvent:event=>store.telemetry('openviking_ingestion',event)});
@@ -60,7 +78,7 @@ export class Coordinator {
         onEvent:event=>store.telemetry('router_context_lifecycle',event)});
     }
     if(!runtime.sharedMemory&&!config.persistentRouter&&runtime.roomMemoryBudget&&runtime.summarizeRoomMemory)this.memoryWorker=new RoomMemoryWorker({
-      store:store.roomMemory,concurrency:Math.max(1,config.concurrency-1),
+      access:room=>this.roomAllowed(room)?this.captureAccess(room)?.signal:false,store:store.roomMemory,concurrency:Math.max(1,config.concurrency-1),
       budget:(request,signal)=>runtime.roomMemoryBudget!(request,signal),
       summarize:(input,signal)=>runtime.summarizeRoomMemory!(input,signal),
       onEvent:event=>store.telemetry('room_memory',event),
@@ -72,38 +90,70 @@ export class Coordinator {
     void next.finally(()=>{if(this.roomLocks.get(roomId)===next)this.roomLocks.delete(roomId);}).catch(()=>{});
     return next;
   }
-  async start() {
+  async start(waitForRecovery=true) {
     if(!this.scheduledTasks.enabled)this.scheduledTasks.service.disable();
     this.store.recovery();
+    this.refreshPrivatePolicy(true);
+    await this.attachments.sweep(true);
+    for(const row of this.store.outbox())if(row.resendOf)this.store.transaction(()=>this.deliveries.settle(row));
     this.scheduledTasks.recover();
     this.scheduledTasks.reconcileProposals();
     for(const row of this.store.outbox('unknown'))if(row.scheduleRunId)this.scheduledTasks.delivery(row.scheduleRunId,'unknown');
     for(const row of this.store.outbox('unknown'))this.enqueueFileDeliveryNotice(row);
     this.reconcileScheduledCancellation();
     this.persistentRouter?.recover();
-    for(const roomId of this.store.roomMemory.rooms())this.memoryWorker?.notify(roomId);
-    for(const roomId of this.store.roomMemory.rooms())this.memoryIngestion?.notify(roomId);
+    for(const roomId of this.store.roomMemory.rooms())if(this.roomAllowed(roomId))this.memoryWorker?.notify(roomId);
+    for(const roomId of this.store.roomMemory.rooms())if(this.roomAllowed(roomId))this.memoryIngestion?.notify(roomId);
     const recovered=this.store.pendingMessages().map(message=>this.queue(message));
     this.timer=setInterval(()=>void this.tick().catch(e=>this.error('tick',e)),100);
     this.timer.unref();
-    await Promise.all(recovered);await this.tick();
+    if(waitForRecovery){await Promise.all(recovered);await this.tick();}else void Promise.all(recovered).catch(error=>this.error('recovery',error));
   }
   async receive(message:GroupMessage) {
     if(this.stopped)throw new Error('Coordinator closed');
     // Persist before waiting for a routing slot. The platform callback can remain pending.
-    const receivedAt=Date.now();
+    if(!this.roomAllowed(message.roomId))return;
+    const lease=this.captureAccess(message.roomId);
+    const privateRoom=parseQqRoomId(message.roomId);
+    if(privateRoom?.kind==='private'&&(message.authorId!==privateRoom.peerId||message.isAdmin))return;
+    if(privateRoom?.kind==='private'&&!message.text.trim()&&!message.attachments.length)return;
+    const control=privateRoom?.kind==='private'&&privateControl(message.text);
+    const receivedAt=Date.now(),cancelAfterCommit=new Set<string>();
     const inserted=await retrySqliteBusy(()=>this.store.transaction(()=>{
+      cancelAfterCommit.clear();if(!this.accessCurrent(lease)||this.store.message(message.id))return false;
+      if(privateRoom?.kind==='private'){
+        const admission=this.privateAccess.admit(message.roomId,control);
+        if(!admission.accepted){
+          if(admission.notice)this.store.enqueue({roomId:message.roomId,text:'消息过于频繁，请稍后再试。仍可用 /status、/cancel 或 /schedule list 查询和控制任务。'},{id:`private-limit:${message.roomId}:${Math.floor(receivedAt/60000)}`});
+          return false;
+        }
+      }
+      prepareFileMetadata(message);
       const inserted=this.store.ingest(message,receivedAt);
+      if(inserted&&control){
+        let text:string;try{text=runPrivateControl(message,this.store,this.scheduledTasks,id=>{cancelAfterCommit.add(id);},parts=>{
+          const actor={kind:'user' as const,roomId:message.roomId,userId:message.authorId,sourceInputId:message.id};
+          if(parts[0]==='list')return this.deliveries.list(actor).map(value=>deliveryText(this.store.outbox().find(row=>row.id===value.id)!)).join('\n')||'暂无待核对投递。';
+          const row=this.store.outbox().find(row=>row.id===parts[1]);if(!row)throw new Error('投递不存在。');
+          const result=this.deliveries.resolve(actor,{outboxId:row.id,decision:parts[0]==='received'?'received':'abandon',partIds:parts[2]?[parts[2]]:undefined,expectedResolutionVersion:row.resolutionVersion??0,key:message.id});return deliveryText(this.store.outbox().find(row=>row.id===result.id)!);
+        });}catch(error){text=this.taskError(error);}
+        this.store.enqueue({roomId:message.roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text},{id:'private-control:'+message.id});this.store.messageStatus(message.id,'routed');return false;
+      }
       if(inserted)this.persistentRouter?.ingest(message);
       return inserted;
     }),{deadlineAt:receivedAt+(this.config.routerQueueTimeoutMs??180_000),stopped:()=>this.stopped});
-    if(!inserted||this.stopped)return;
+    for(const id of cancelAfterCommit){this.active.get(id)?.abort.abort();void this.runtime.cancel(id).catch(error=>this.error('cancel',error));}
+    if(!inserted||this.stopped||!this.accessCurrent(lease))return;
     const queued=this.queue(message);
     this.memoryWorker?.notify(message.roomId);
     this.memoryIngestion?.notify(message.roomId);
     await queued;
   }
   private queue(message:GroupMessage):Promise<void> {
+    const room=parseQqRoomId(message.roomId);
+    if(!this.roomAllowed(message.roomId)||room?.kind==='private'&&(message.authorId!==room.peerId||message.isAdmin)){
+      this.store.messageStatus(message.id,'failed');return Promise.resolve();
+    }
     let batch=this.batches.get(message.roomId);
     if(!batch){batch={items:[]};this.batches.set(message.roomId,batch);}
     const promise=new Promise<void>((resolve,reject)=>batch!.items.push({message,resolve,reject}));
@@ -200,21 +250,23 @@ export class Coordinator {
   }
   private async routeBatch(messages:GroupMessage[]) {
     const roomId=messages[0].roomId;
+    if(!this.roomAllowed(roomId))return;
+    const lease=this.captureAccess(roomId);
     let split=false;
     await this.room(roomId,async()=>{
-      if(this.stopped)return;
+      if(this.stopped||!this.accessCurrent(lease))return;
       const intakeAt=Math.min(...messages.map(message=>Number(this.store.db.prepare('SELECT received_at FROM messages WHERE id=?').get(message.id)?.received_at??Date.now())));
       const preparationDeadline=Math.min(Date.now()+(this.config.routerTurnTimeoutMs??120_000),intakeAt+(this.config.routerQueueTimeoutMs??180_000));
-      const databaseOptions={deadlineAt:preparationDeadline,stopped:()=>this.stopped};
+      const databaseOptions={deadlineAt:preparationDeadline,stopped:()=>this.stopped||!this.accessCurrent(lease)};
       const expired=await retrySqliteBusy(()=>this.store.transaction(()=>{
         const expired=!this.persistentRouter&&Date.now()>=preparationDeadline;
         for(const message of messages){
           this.store.messageStatus(message.id,expired?'failed':'processing');
-          if(expired&&hasWakeCandidate(message,this.config.botCallNames))this.store.enqueue({roomId,replyToMessageId:message.messageId,text:'这条请求已超过排队时限，原文已保留，本次尚未执行任务。'},{id:'route-failed:'+message.id});
+          if(expired&&hasWakeCandidate(message,this.config.botCallNames))this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:'这条请求已超过排队时限，原文已保留，本次尚未执行任务。'},{id:'route-failed:'+message.id});
         }
         return expired;
       }),databaseOptions);
-      if(this.stopped||expired)return;
+      if(this.stopped||expired||!this.accessCurrent(lease))return;
       const recentMessages=this.store.recent(roomId,this.config.recentMessageLimit,messages[0].id);
       const seen=new Set(recentMessages.map(message=>message.id));
       for(const message of messages)if(message.replyToMessageId){
@@ -283,9 +335,9 @@ export class Coordinator {
             await retrySqliteBusy(()=>this.persistentRouter!.startAttempt(prepared!,2),{...databaseOptions,deadlineAt:deadline});
             inferenceStarted=true;
           }else await this.attachMemberMemory(request);
-          const parsed=routeSchema.parse(await this.executeRouter(request,readContext,prepared));const bound=enforceReferenceThreads(parsed,request);this.validateActions(bound,request);rawActions=parsed;actions=bound;break;
+          const parsed=routeSchema.parse(await this.executeRouter(request,readContext,prepared,lease));const bound=enforceReferenceThreads(parsed,request);this.validateActions(bound,request);rawActions=parsed;actions=bound;break;
         }
-        catch(e){if(isSqliteBusy(e))throw e;
+        catch(e){if(!this.accessCurrent(lease))return;if(isSqliteBusy(e))throw e;
           this.error('router_attempt',{messageIds:messages.map(message=>message.id),attempt,code:routerErrorCode(e),causeCode:(e as {causeCode?:unknown})?.causeCode,error:String(e)});
           const code=String((e as {code?:unknown})?.code??'');lastFailureCode=routerErrorCode(e);
           if(this.persistentRouter){
@@ -299,13 +351,14 @@ export class Coordinator {
           if(['ROUTER_RETRY_EXHAUSTED','ROUTER_DEADLINE','ROUTER_CALL_LIMIT','ROUTER_REBUILD_LIMIT','ROUTER_PROVIDER_UNAVAILABLE'].includes(code))break;
           if(!this.persistentRouter&&['ROUTER_COMPACTION_TRUNCATED','ROUTER_COMPACTION_EMPTY','STRUCTURED_OUTPUT_INVALID','ROUTER_RECOVERY_FAILED'].includes(code))break;}
       }
+      if(!this.accessCurrent(lease))return;
       if(this.stopped){for(const message of messages)this.store.messageStatus(message.id,'pending');return;}
       if(!actions){
         if(split){for(const message of messages)this.store.messageStatus(message.id,'pending');return;}
         await retrySqliteBusy(()=>this.store.transaction(()=>{
           for(const message of messages){
             this.store.messageStatus(message.id,'failed');
-            if(hasWakeCandidate(message,this.config.botCallNames))this.store.enqueue({roomId,replyToMessageId:message.messageId,text:modelFailed?MODEL_ERROR_REPLY:capacityFailed?'这条输入及必要引用超过了当前处理容量，原文已保留，本次尚未执行任务。':'暂时没能处理这条消息，请稍后再试。'},{id:'route-failed:'+message.id});
+            if(hasWakeCandidate(message,this.config.botCallNames))this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:modelFailed?MODEL_ERROR_REPLY:capacityFailed?'这条输入及必要引用超过了当前处理容量，原文已保留，本次尚未执行任务。':'暂时没能处理这条消息，请稍后再试。'},{id:'route-failed:'+message.id});
           }
           if(prepared&&this.persistentRouter)this.finishFailedTurn(prepared,{code:lastFailureCode});
           else if(this.persistentRouter){const pending=this.store.routerSessions.pendingTurns(roomId)[0];if(pending)this.store.routerSessions.failTurn({turnId:pending.id,generation:pending.generation,error:{code:capacityFailed?'ROUTER_PAYLOAD_OVERSIZED':lastFailureCode}});}
@@ -313,25 +366,39 @@ export class Coordinator {
         return;
       }
       actions=enforceExplicitActivation(actions,messages,this.config.botCallNames);
+      const preparationKey=(action:RouteAction)=>action.action+':'+('sourceMessageIds'in action?action.sourceMessageIds.join('\0'):'');
+      const preparationErrors=new Map<string,unknown>(),actorErrors=new Map<string,unknown>();
       if(this.scheduledTasks.enabled)await Promise.all(messages.filter(message=>actions!.some(action=>'sourceMessageIds'in action&&action.sourceMessageIds.includes(message.id)
         &&(action.action==='manage_schedule'||action.action==='open_thread'&&action.scheduleOperations?.length||'threadId'in action&&this.store.thread(action.threadId)?.scheduledTask)))
-        .map(message=>this.scheduledTasks.actor(message,'router',true)));
+        .map(message=>this.scheduledTasks.actor(message,'router',true).catch(error=>{actorErrors.set(message.id,error);})));
+      if(this.scheduledTasks.enabled)for(const action of actions){
+        const operations=action.action==='manage_schedule'?[action.operation]:action.action==='open_thread'?action.scheduleOperations??[]:[];
+        if(operations.length&&'sourceMessageIds'in action){const source=messages.find(message=>message.id===action.sourceMessageIds[0]);if(source)try{if(actorErrors.has(source.id))throw actorErrors.get(source.id);for(const operation of operations)await this.scheduledTasks.prepareRouter(source,operation,lease?.signal);}catch(error){preparationErrors.set(preparationKey(action),error);}}
+      }
+      const preparedResends=new Map<string,()=>string>();
+      for(const action of actions)if(action.action==='resend_delivery'){
+        const source=messages.find(m=>m.id===action.sourceMessageIds[0])!;
+        try{preparedResends.set(preparationKey(action),await this.deliveries.prepareResend({kind:'user',roomId,userId:source.authorId,sourceInputId:source.id},{...action,key:source.id}));}
+        catch(error){preparationErrors.set(preparationKey(action),error);}
+      }
       let proposal:MemberCommitProposal|undefined,memberReceipts:MemberCommitReceipt[]=[];
       if(prepared&&this.runtime.sharedMemory){
         this.store.routerSessions.checkBudget(prepared.turn.id);this.persistentRouter?.validateSources(prepared);
         proposal=await withinRouterDeadline(prepared.turn.deadlineAt!,()=>retrySqliteBusy(()=>prepareMemberCommit(this.store,this.runtime.sharedMemory!,this.store.routerSessions.turn(prepared!.turn.id)!,request,actions!),{...databaseOptions,deadlineAt:prepared!.turn.deadlineAt!}));
         actions=enforceReferenceThreads(proposal.actions,request);this.validateActions(actions,request);
-        memberReceipts=await withinRouterDeadline(prepared.turn.deadlineAt!,()=>applyMemberCommit(this.runtime.sharedMemory!,proposal!));
+        if(!this.accessCurrent(lease))return;
+        memberReceipts=await withinRouterDeadline(prepared.turn.deadlineAt!,()=>applyMemberCommit(this.runtime.sharedMemory!,proposal!,lease?.signal));
       }
       if(this.stopped)return;
       const steers:{threadId:string;input:ThreadInput}[]=[];const cancels=new Set<string>();
       const bySource=new Map<string,RouteAction>();
       for(const action of actions)if('sourceMessageIds'in action)for(const source of action.sourceMessageIds)bySource.set(source,action);
       const emitted=new Set<RouteAction>();const created=new Map<RouteAction,string>();
-      const acknowledgements=new Map<string,{text:string;replyToMessageId:string}>();
+      const acknowledgements=new Map<string,{text:string;replyToMessageId?:string;sourceInputId?:string}>();
       const immediates=new Map<RouteAction,{threadId:string;through:number;source:GroupMessage;reply:NonNullable<Extract<RouteAction,{action:'append_thread'}>['immediateReply']>}>();
       const applied:RouteAction[]=[];
       const apply=()=>{
+        if(!this.accessCurrent(lease))return;
         const existingOutbox=new Set(this.store.outbox('pending').map(row=>row.id));
         // Process sources in intake order, regardless of model action/source ordering.
         for(const message of messages) {
@@ -341,7 +408,7 @@ export class Coordinator {
           // have acquired a thread after the model received its snapshot.
           const reference=this.store.resolveReference(message,currentTime);
           if(reference.status==='resolved'&&reference.threadId&&!this.store.thread(reference.threadId)?.scheduledTask
-            &&action.action!=='manage_schedule'&&!(action.action==='open_thread'&&action.scheduleOperations?.length)){
+            &&action.action!=='manage_schedule'&&action.action!=='resolve_delivery'&&action.action!=='resend_delivery'&&!(action.action==='open_thread'&&action.scheduleOperations?.length)){
             this.store.bindMessageThread(message,reference.threadId);
             if(action.action==='open_thread'||('threadId'in action&&action.threadId!==reference.threadId)){
               action=enforceReferenceThreads([{...action,sourceMessageIds:[message.id]} as RouteAction],{...request,references:{[message.id]:reference}})[0];
@@ -349,27 +416,43 @@ export class Coordinator {
           }
           applied.push('sourceMessageIds'in action?{...action,sourceMessageIds:[message.id]}:action);
           if(action.action==='silence')continue;
-          if(action.action==='manage_schedule'){
+          if(action.action==='resolve_delivery'||action.action==='resend_delivery'){
             if(emitted.has(originalAction))continue;emitted.add(originalAction);
             try{
+              let text:string;
+              if(action.action==='resend_delivery'){if(preparationErrors.has(preparationKey(originalAction)))throw preparationErrors.get(preparationKey(originalAction));const run=preparedResends.get(preparationKey(originalAction));if(!run)throw new Error('补发内容尚未核验。');text='补发已登记：'+run();const original=this.store.outbox().find(row=>row.id===action.outboxId),scheduled=original?.scheduleRunId?this.scheduledTasks.service.getRun(original.scheduleRunId):undefined;if(scheduled)text+='。这是原计划时间 '+new Date(scheduled.scheduledAt).toISOString()+' 的历史结果。';}
+              else{
+                const outcome=this.deliveries.resolve({kind:'user',roomId,userId:message.authorId,sourceInputId:message.id},{...action,key:message.id});text=deliveryText(this.store.outbox().find(row=>row.id===outcome.id)!);
+                if(action.resumeSchedule&&outcome.closed){
+                  const row=this.store.outbox().find(row=>row.id===action.outboxId),run=row?.scheduleRunId?this.scheduledTasks.service.getRun(row.scheduleRunId):undefined;
+                  if(run)try{const plan=this.scheduledTasks.service.get({kind:'admin'},run.scheduleId);text+='\n'+this.scheduledTasks.receipt(this.scheduledTasks.applyRouter(message,{op:'resume',id:plan.id,expectedVersion:plan.version}));}catch(error){text+='\n结案已完成，恢复未完成：'+this.taskError(error);}
+                }
+              }
+              this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text},{id:'delivery-control:'+message.id});
+            }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:this.taskError(error)},{id:'delivery-control:'+message.id});}
+          }else if(action.action==='manage_schedule'){
+            if(emitted.has(originalAction))continue;emitted.add(originalAction);
+            try{
+              if(preparationErrors.has(preparationKey(originalAction)))throw preparationErrors.get(preparationKey(originalAction));
               const receipt=this.scheduledTasks.applyRouter(message,action.operation);
-              this.store.enqueue({roomId,replyToMessageId:message.messageId,text:this.scheduledTasks.receipt(receipt)},{id:'schedule-control:'+message.id});
-            }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId,text:this.taskError(error)},{id:'schedule-control:'+message.id});}
+              this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:this.scheduledTasks.receipt(receipt)},{id:'schedule-control:'+message.id});
+            }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:this.taskError(error)},{id:'schedule-control:'+message.id});}
           }else if(action.action==='reply_direct'||action.action==='clarify'){
             if(emitted.has(action))continue;emitted.add(action);
             const explicit=messages.some(source=>'sourceMessageIds'in action&&action.sourceMessageIds.includes(source.id)&&hasWakeCandidate(source,this.config.botCallNames));
             const last=this.lastChatter.get(roomId)??0;
             if(explicit||action.action==='clarify'||Date.now()-last>=20_000){
-              this.store.enqueue({roomId,replyToMessageId:message.messageId,text:action.text},{id:'direct:'+message.id,associationThreadId:reference.threadId});
+              this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:action.text},{id:'direct:'+message.id,associationThreadId:reference.threadId});
               this.lastChatter.set(roomId,Date.now());
             }
           }else if(action.action==='open_thread'){
             if(action.scheduleOperations?.length&&!emitted.has(originalAction)){
               emitted.add(originalAction);
               try{
+                if(preparationErrors.has(preparationKey(originalAction)))throw preparationErrors.get(preparationKey(originalAction));
                 const receipts=this.scheduledTasks.service.transaction(()=>action.action==='open_thread'?action.scheduleOperations!.map((operation,index)=>this.scheduledTasks.applyRouter(message,operation,String(index))):[]);
-                this.store.enqueue({roomId,replyToMessageId:message.messageId,text:receipts.map(receipt=>this.scheduledTasks.receipt(receipt)).join('\n')},{id:'schedule-control:'+message.id});
-              }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId,text:this.taskError(error)},{id:'schedule-control:'+message.id});}
+                this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:receipts.map(receipt=>this.scheduledTasks.receipt(receipt)).join('\n')},{id:'schedule-control:'+message.id});
+              }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:this.taskError(error)},{id:'schedule-control:'+message.id});}
             }
             const context=this.inputContext(message,action,request);
             const existing=created.get(action);
@@ -378,42 +461,47 @@ export class Coordinator {
               const explicit=messages.some(source=>action.sourceMessageIds.includes(source.id)&&hasWakeCandidate(source,this.config.botCallNames));
               const thread=this.store.createThread(message,action.subject,explicit,context.messages,context.metadata);created.set(action,thread.id);
               if(reference.status==='unbound')this.store.bindReferencedThread(message,thread.id,currentTime);
-              acknowledgements.set(thread.id,{text:action.acknowledgement?.trim()||'我来核对一下这个问题，查清楚再回复你。',replyToMessageId:message.messageId});
+              acknowledgements.set(thread.id,{text:action.acknowledgement?.trim()||'我来核对一下这个问题，查清楚再回复你。',replyToMessageId:message.messageId||undefined,sourceInputId:message.id});
             }
             if(action.immediateReply){const id=created.get(action)!;immediates.set(originalAction,{threadId:id,through:this.store.thread(id)!.latestInputSeq,source:message,reply:action.immediateReply});}
           }else if('threadId' in action){
             const thread=this.store.thread(action.threadId)!;
             if(action.action==='request_handoff'){
               if(thread.scheduledTask)try{this.scheduledTasks.readThread(message,thread);}catch(error){
-                this.store.enqueue({roomId,replyToMessageId:message.messageId,text:this.taskError(error)},{id:'control:'+message.id});continue;
+                this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:this.taskError(error)},{id:'control:'+message.id});continue;
               }
               if(emitted.has(action))continue;emitted.add(action);
               this.store.bindMessageThread(message,thread.id);
-              this.store.enqueue({roomId,replyToMessageId:message.messageId,text:taskHandoff(this.store,roomId,thread.id,message.id,action.view)},
+              this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:taskHandoff(this.store,roomId,thread.id,message.id,action.view)},
                 {id:'handoff:'+message.id,kind:'handoff',associationThreadId:thread.id});
               this.store.telemetry('handoff_reply_queued',{threadId:thread.id,sourceId:message.id,view:action.view??'current'});
               continue;
             }
             if(thread.scheduledTask){
               try{
+                if(actorErrors.has(message.id))throw actorErrors.get(message.id);
                 if(action.action==='request_status'){
                   this.scheduledTasks.readThread(message,thread);
-                  this.store.enqueue({roomId,replyToMessageId:message.messageId,text:`本次定时任务状态：${thread.status}。`},{id:'control:'+message.id});
+                  this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:threadDeliveryStatus(this.store,thread.id)},{id:'control:'+message.id});
                 }else if(action.action==='request_cancel'){
                   this.scheduledTasks.stopThread(message,thread);cancels.add(thread.id);
-                  this.store.enqueue({roomId,replyToMessageId:message.messageId,text:'已请求停止本次执行；后续循环仍保留。取消整个计划请明确取消定时任务。'},{id:'control:'+message.id});
+                  this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:'已请求停止本次执行；后续循环仍保留。取消整个计划请明确取消定时任务。'},{id:'control:'+message.id});
                 }else if(action.action==='append_thread'){
                   this.scheduledTasks.assertThreadControl(message,thread);
-                  const context=this.inputContext(message,action,request),followup=this.store.createThread(message,action.resolvedRequest??message.text,true,context.messages,context.metadata);
-                  created.set(action,followup.id);if(action.immediateReply)immediates.set(originalAction,{threadId:followup.id,through:followup.latestInputSeq,source:message,reply:action.immediateReply});acknowledgements.set(followup.id,{text:action.acknowledgement?.trim()||'我接着核对这个问题。',replyToMessageId:message.messageId});
+                  const context=this.inputContext(message,action,request),original=this.scheduledTasks.input(thread);
+                  const sources=(original?.attachmentRefs??[]).flatMap(ref=>{const source=this.store.message(ref.sourceInputId);return source&&source.roomId===message.roomId?[{...source,attachments:source.attachments.filter(a=>a.attachmentId===ref.attachmentId)}]:[];});
+                  const subject=`${original?.title??thread.subject}：${action.resolvedRequest??message.text}`;
+                  const followup=this.store.createThread(message,subject,true,[...context.messages,...sources],{...context.metadata,routingContext:{resolvedRequest:`原计划条件：${original?.instructions??thread.subject}\n原执行摘要：${thread.summary}\n本次补充：${action.resolvedRequest??message.text}`,sourceMessageIds:[message.id],contextMessageIds:sources.map(m=>m.id)}});
+                  followup.followupOf={scheduleId:thread.scheduledTask.scheduleId,scheduleRunId:thread.scheduledTask.scheduleRunId,threadId:thread.id};this.store.saveThread(followup);
+                  created.set(action,followup.id);if(action.immediateReply)immediates.set(originalAction,{threadId:followup.id,through:followup.latestInputSeq,source:message,reply:action.immediateReply});acknowledgements.set(followup.id,{text:action.acknowledgement?.trim()||'我接着核对这个问题。',replyToMessageId:message.messageId||undefined,sourceInputId:message.id});
                 }
-              }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId,text:this.taskError(error)},{id:'control:'+message.id});}
+              }catch(error){this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:this.taskError(error)},{id:'control:'+message.id});}
               continue;
             }
             if(action.action==='append_thread'){
               if(thread.status==='cancelled'){
                 if(message.authorId!==thread.ownerId&&!message.isAdmin){
-                  this.store.enqueue({roomId,replyToMessageId:message.messageId,text:'这个问题已停止，只有原提问者或群管理员可以恢复处理。'},
+                  this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:'这个问题已停止，只有原提问者或群管理员可以恢复处理。'},
                     {id:'control:'+message.id,associationThreadId:thread.id});continue;
                 }
                 thread.epoch++;
@@ -427,17 +515,17 @@ export class Coordinator {
               const input=this.store.append(thread,message,action.kind??'supplement',context.messages,context.metadata);
               if(input.seq>previousSeq){thread.pendingInputs=scheduleWorkerInputs(thread.pendingInputs,input.seq,workerInputScheduling(this.config.workerInputScheduling));this.store.saveThread(thread);}
               if(reference.status==='unbound')this.store.bindReferencedThread(message,thread.id,currentTime);
-              if(needsAcknowledgement)acknowledgements.set(thread.id,{text:action.acknowledgement?.trim()||'收到，我接着核对你补充的内容。',replyToMessageId:message.messageId});
+              if(needsAcknowledgement)acknowledgements.set(thread.id,{text:action.acknowledgement?.trim()||'收到，我接着核对你补充的内容。',replyToMessageId:message.messageId||undefined,sourceInputId:message.id});
               if(action.immediateReply)immediates.set(originalAction,{threadId:thread.id,through:input.seq,source:message,reply:action.immediateReply});
               if(this.active.has(thread.id))steers.push({threadId:thread.id,input});
             }else if(action.action==='request_cancel'){
               const allowed=message.authorId===thread.ownerId||message.isAdmin;
               if(allowed){thread.status='cancelled';thread.epoch++;thread.activeRunId=undefined;this.store.saveThread(thread);cancels.add(thread.id);}
               this.store.bindMessageThread(message,thread.id);
-              this.store.enqueue({roomId,replyToMessageId:message.messageId,text:allowed?'已停止这个问题的处理。':'只有提问者或群管理员可以停止这个任务。'},{id:'control:'+message.id,associationThreadId:thread.id});
+              this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:allowed?'已停止这个问题的处理。':'只有提问者或群管理员可以停止这个任务。'},{id:'control:'+message.id,associationThreadId:thread.id});
             }else if(action.action==='request_status'){
               this.store.bindMessageThread(message,thread.id);
-              this.store.enqueue({roomId,replyToMessageId:message.messageId,text:`这个问题当前状态：${({queued:'排队中',running:'正在处理',needs_input:'等待补充',idle:'已回答',failed:'处理失败',cancelled:'已停止'} as const)[thread.status]}。`},{id:'control:'+message.id,associationThreadId:thread.id});
+              this.store.enqueue({roomId,replyToMessageId:message.messageId||undefined,sourceInputId:message.id,text:threadDeliveryStatus(this.store,thread.id)},{id:'control:'+message.id,associationThreadId:thread.id});
             }
           }
         }
@@ -564,6 +652,8 @@ export class Coordinator {
       // projection as well as supplying intact context after a restart.
       const contextMessages=(input.contextMessages??[]).flatMap(saved=>{
         const original=this.store.messageBefore(input.message.roomId,saved.id,input.message.id);
+        const selected=saved.attachments.flatMap(a=>a.attachmentId?[a.attachmentId]:[]);
+        if(original&&selected.length)original.attachments=original.attachments.filter(a=>!!a.attachmentId&&selected.includes(a.attachmentId));
         return original&&(!original.attachments.length||original.authorId===input.message.authorId
           ||original.messageId===input.message.replyToMessageId)?[original]:[];
       });
@@ -573,17 +663,25 @@ export class Coordinator {
   private routerConfigHash(roomId:string):string {
     return this.runtime.routerConfigurationHash?.(roomId)??createHash('sha256').update(JSON.stringify({router:this.config.router,botCallNames:this.config.botCallNames,protocol:1})).digest('hex');
   }
-  private async executeRouter(request:RouterRequest,readContext:Parameters<RuntimePort['route']>[1],prepared?:PreparedRouterTurn){
+  private async executeRouter(request:RouterRequest,readContext:Parameters<RuntimePort['route']>[1],prepared?:PreparedRouterTurn,capturedLease?:AccessLease){
+    const lease=capturedLease??this.captureAccess(request.roomId);
+    if(lease)this.privateAccess.assert(lease);
     const taskTools=this.scheduledTasks.routerTools(request);
-    if(!prepared)return this.runtime.route(request,readContext,undefined,taskTools);
+    if(isPrivateRoom(request.roomId)&&request.event==='messages')taskTools.push({name:'deliveries_query',description:'List this private peer’s delivery facts, unresolved parts and resolution versions. Requires a current sourceMessageId. Does not send or resolve anything.',inputSchema:{type:'object',properties:{sourceMessageId:{type:'string'},outboxId:{type:'string'}},required:['sourceMessageId'],additionalProperties:false},execute:async value=>{
+      if(lease)this.privateAccess.assert(lease);const sourceId=(value as {sourceMessageId?:string})?.sourceMessageId,source=request.messages.find(m=>m.id===sourceId);if(!source)throw new Error('Invalid delivery query source');const actor={kind:'user' as const,roomId:source.roomId,userId:source.authorId,sourceInputId:source.id},outboxId=(value as {outboxId?:string}).outboxId;return outboxId?this.deliveries.query(actor,outboxId):this.deliveries.list(actor,true);
+    }});
+    if(!prepared){
+      const result=await this.runtime.route(request,readContext,lease?{signal:lease.signal,consumeModelCall:()=>{this.privateAccess.assert(lease);}}:undefined,taskTools);
+      if(lease)this.privateAccess.assert(lease);return result;
+    }
     const turn=this.store.routerSessions.checkBudget(prepared.turn.id),deadline=turn.deadlineAt!;
     const provider=JSON.stringify([this.config.router.provider,this.config.router.model,this.config.router.baseUrl??this.config.baseUrl]);
     const databaseOptions={deadlineAt:deadline,stopped:()=>this.stopped};
     await retrySqliteBusy(()=>this.store.routerSessions.admitProvider(provider,turn.id,Math.max(1,deadline-Date.now())),databaseOptions);
-    const startedAt=Date.now(),signal=AbortSignal.timeout(Math.max(1,deadline-Date.now()));
+    const startedAt=Date.now(),signal=AbortSignal.any([AbortSignal.timeout(Math.max(1,deadline-Date.now())),...(lease?[lease.signal]:[])]);
     try{
       const result=await withinRouterDeadline(deadline,()=>this.runtime.route(request,readContext,{signal,
-        consumeModelCall:summary=>this.store.routerSessions.consumeModelCall(turn.id,summary),
+        consumeModelCall:summary=>{if(lease)this.privateAccess.assert(lease);return this.store.routerSessions.consumeModelCall(turn.id,summary);},
         onModelCall:event=>this.store.telemetry('router_model_call',{turnId:turn.id,roomId:turn.roomId,...event}),
       },taskTools));
       this.store.routerSessions.checkBudget(turn.id);
@@ -634,6 +732,7 @@ export class Coordinator {
       .sort((a,b)=>a.seq-b.seq).map(input=>`${input.message.authorId}: ${input.message.text}`).join('\n');
   }
   private async prepareReplyPreferences(original:OutboxRow,freeze:()=>boolean):Promise<boolean>{
+    if(!this.roomAllowed(original.message.roomId))return false;const lease=this.captureAccess(original.message.roomId);
     // Host receipts and failure notices must remain deliverable when the memory
     // backend or model is unavailable. Rewriting could also invert their status.
     if(original.kind==='handoff'||original.scheduleRunId||original.fileDeliveryNoticeFor||original.fileDeliveries?.some(file=>file.status==='sent')||['schedule-control:','memory-confirm:','route-failed:','worker-failed:','result-model-failed:'].some(prefix=>original.id.startsWith(prefix)))return freeze();
@@ -644,7 +743,7 @@ export class Coordinator {
     const memberIds=[...new Set([...(targetMember?[targetMember]:[]),...previous.map(value=>value.memberId)])].slice(0,20);if(!memberIds.length)return freeze();
     let phase:'read'|'rewrite'|'verify'='read';
     try{
-      const latest=await this.runtime.sharedMemory.project(row.message.roomId,memberIds);
+      const latest=await this.runtime.sharedMemory.project(row.message.roomId,memberIds);if(!this.accessCurrent(lease))return false;
       const before=new Map(previous.map(value=>[value.memberId,value]));
       const changed=this.preferenceRevisions(latest)!==this.preferenceRevisions(latest.map(value=>before.get(value.memberId)??{memberId:value.memberId,revision:0,fields:{},omittedKeys:[]}));
       let text=row.hostLinkTemplate??row.message.text;
@@ -655,10 +754,11 @@ export class Coordinator {
         text=await this.runtime.refreshReplyPreferences({roomId:row.message.roomId,text,memberMemory:latest,previousMemberMemory:previous,
           ...(targetMember?{replyToMemberId:targetMember}:{}),...(row.preferenceSourceText?{sourceText:row.preferenceSourceText}:{})});
       }
-      assertLinkReferencesUnchanged(originalTemplate,text);
+      if(!this.accessCurrent(lease))return false;assertLinkReferencesUnchanged(originalTemplate,text);
       phase='verify';
       // A preference changed while the model was rewriting: leave this exact outbox pending.
       const verified=changed?await this.runtime.sharedMemory.project(row.message.roomId,memberIds):latest;
+      if(!this.accessCurrent(lease))return false;
       if(this.preferenceRevisions(latest)!==this.preferenceRevisions(verified))throw new Error('Reply preferences changed during refresh');
       const current=this.store.outbox('pending').find(value=>value.id===row.id) as PreferenceOutbox|undefined;
       if(!current||current.message.text!==row.message.text)return false;
@@ -666,6 +766,7 @@ export class Coordinator {
       // No await is allowed between the final revision verification and registration as sending.
       return freeze();
     }catch(error){
+      if(!this.accessCurrent(lease))return false;
       const current=this.store.outbox('pending').find(value=>value.id===row.id) as PreferenceOutbox|undefined;
       const rawCode=(error as {code?:unknown})?.code,code=typeof rawCode==='string'&&/^[A-Z][A-Z0-9_]{0,79}$/.test(rawCode)?rawCode:'PREFERENCE_REFRESH_FAILED';
       if(current){
@@ -695,6 +796,22 @@ export class Coordinator {
   }
   /** Recheck between file actions so cancellation stops the remaining delivery. */
   private deliveryCurrent(row:OutboxRow):boolean {
+    const persisted=this.store.outbox().find(value=>value.id===row.id);
+    if(persisted&&(['pending','sending'].includes(row.status)&&!['pending','sending'].includes(persisted.status)
+      ||JSON.stringify(persisted.invalidatedParts)!==JSON.stringify(row.invalidatedParts))){
+      row.status=persisted.status;row.reason=persisted.reason;return false;
+    }
+    const unavailable=!this.roomAllowed(row.message.roomId)?'private_access_denied':row.deliveryExpiresAt!==undefined&&Date.now()>row.deliveryExpiresAt?'delivery_expired':undefined;
+    if(unavailable){
+      // Called before each transport write. Preserve confirmed/uncertain receipts,
+      // while settling the remaining tail so it cannot stay sending forever.
+      if(row.status==='pending'||row.status==='sending'){
+        row.status=row.fileDeliveries?.some(f=>f.status==='unknown')||row.messageDelivery?.status==='unknown'?'unknown':'stale';
+        row.reason=unavailable;this.store.saveOutbox(row);
+        if(row.scheduleRunId)this.scheduledTasks.delivery(row.scheduleRunId,row.status);
+      }
+      return false;
+    }
     if(row.fileDeliveryNoticeFor){
       const parent=this.store.outbox().find(value=>value.id===row.fileDeliveryNoticeFor);
       if(!parent||parent.message.roomId!==row.message.roomId||parent.scheduleRunId&&(!this.scheduledTasks.enabled||!this.scheduledTasks.service.canPublish(parent.scheduleRunId))){row.status='stale';this.store.saveOutbox(row);return false;}
@@ -712,6 +829,15 @@ export class Coordinator {
   }
   async tick() {
     if(this.stopped)return;
+    this.refreshPrivatePolicy();
+    await this.attachments.sweep();
+    // Release expired, never-attempted deliveries before overlap checks for the
+    // next period. In-flight and unknown platform operations keep their facts.
+    this.store.transaction(()=>{
+      for(const row of this.store.outbox('pending'))if(row.deliveryExpiresAt!==undefined&&Date.now()>row.deliveryExpiresAt)this.deliveryCurrent(row);
+      for(const run of this.scheduledTasks.service.activeRuns())if(run.snapshot.deliveryMode!=='local'&&!run.outboxId
+        &&!['queued','running'].includes(run.status)&&run.deliveryStatus==='pending'&&run.deliveryExpiresAt!==undefined&&Date.now()>run.deliveryExpiresAt)this.scheduledTasks.delivery(run.id,'stale');
+    });
     if(this.scheduleExecution)this.scheduledTasks.tick();
     this.reconcileScheduledCancellation();
     const queued=this.store.threadsInStatus('queued');
@@ -720,6 +846,7 @@ export class Coordinator {
     // slots so a steady chat queue cannot starve due work.
     const fair=this.config.concurrency===1&&this.lastWorkerWasScheduled?[...immediate,...scheduled]:[...scheduled,...immediate];
     for(const thread of fair) {
+      if(!this.roomAllowed(thread.roomId))continue;
       if(this.active.size>=this.config.concurrency)break;
       if(this.active.has(thread.id)||thread.pendingInputs&&thread.pendingInputs.readyAt>Date.now()||this.hasUnresolvedThreadInput(thread))continue;
       if(thread.scheduledTask){
@@ -745,6 +872,23 @@ export class Coordinator {
   }
   private async run(threadId:string,abort:AbortController) {
     const thread=this.store.thread(threadId)!;
+    if(!this.roomAllowed(thread.roomId))return;
+    const lease=this.captureAccess(thread.roomId);
+    if(lease&&thread.scheduledTask?.authority!=='system'&&thread.ownerId!==thread.roomId.split(':')[3]){thread.status='cancelled';thread.epoch++;this.store.saveThread(thread);return;}
+    if(lease)lease.signal.addEventListener('abort',()=>abort.abort(),{once:true,signal:abort.signal});
+    if(thread.scheduledTask){
+      const input=this.scheduledTasks.input(thread);
+      try{
+        if(isPrivateRoom(thread.roomId)&&this.publisher.verifyFriend){
+          if((this.friendRetryAt.get(thread.roomId)??0)>Date.now())return;
+          let friend:boolean;try{friend=await this.publisher.verifyFriend(thread.roomId);this.friendRetryAt.delete(thread.roomId);}catch{this.friendRetryAt.set(thread.roomId,Date.now()+5000);return;}
+          if(!friend)throw new Error('friend_unavailable');
+        }
+        if(input?.attachmentRefs?.length)await this.attachments.validateRefs(thread.roomId,input.attachmentRefs,abort.signal);
+        if(!this.accessCurrent(lease))return;
+        const current=this.store.thread(threadId);if(!current||current.status!=='queued'||current.epoch!==thread.epoch)return;
+      }catch(error){this.scheduledTasks.service.block(thread.scheduledTask.scheduleId,error instanceof Error&&error.message==='friend_unavailable'?'friend_unavailable':'attachment_unavailable',{cancelRunning:true});return;}
+    }
     if(!this.scheduledTasks.start(thread)){thread.status='cancelled';thread.epoch++;this.store.saveThread(thread);return;}
     delete thread.pendingInputs;
     const runId='r-'+randomUUID();thread.status='running';thread.activeRunId=runId;thread.epoch++;
@@ -764,9 +908,11 @@ export class Coordinator {
       const workerRequest:WorkerRequest={thread,runId,inputs:this.workerInputs(threadId),workspace,signal:AbortSignal.any([abort.signal,AbortSignal.timeout(Math.max(1,thread.workerBudget.deadlineAt-Date.now()))]),
         budget:{remainingSteps:thread.workerBudget.remainingSteps,deadlineAt:thread.workerBudget.deadlineAt},previousRequirementSnapshot:this.store.requirementSnapshot(threadId),scheduledInput};
       workerRequest.taskTools=this.scheduledTasks.workerTools(workerRequest);
+      if(isPrivateRoom(thread.roomId)){workerRequest.taskTools.push(this.attachments.tool(workerRequest));workerRequest.attachmentWriter=this.attachments.writer(workerRequest);}
       const report=reportSchema.parse(await this.runtime.runWorker(workerRequest));
-      if(this.stopped)return;
+      if(this.stopped||!this.accessCurrent(lease))return;
       if(report.scheduleProposalIds?.length)await this.scheduledTasks.refreshWorkerActor(thread);
+      if(!this.accessCurrent(lease))return;
       const current=this.store.thread(threadId)!;
       if(current.epoch!==epoch||current.activeRunId!==runId||current.status==='cancelled'||!this.scheduledTasks.valid(current)){this.scheduledTasks.rejectWorker(thread,runId,'stale_run');return;}
       if(report.threadId!==threadId||report.runId!==runId||report.coveredInputSeq>current.latestInputSeq||report.basedOnRevision>current.revision)throw new Error('Worker report identity or version mismatch');
@@ -784,7 +930,7 @@ export class Coordinator {
         this.scheduledTasks.finish(current,report.status==='ready'?'succeeded':report.status==='needs_input'?'needs_input':'failed',{resultId:'result-'+runId});
       });
     }catch(e){
-      if(this.stopped)return;
+      if(this.stopped||!this.accessCurrent(lease))return;
       const current=this.store.thread(threadId)!;
       if(this.active.get(threadId)?.supersededBy||current.revision>thread.revision){
         this.scheduledTasks.rejectWorker(thread,runId,'superseded');
@@ -821,7 +967,10 @@ export class Coordinator {
     }
   }
   private async routeResult(result:ResultRow){
+    if(!this.roomAllowed(result.roomId))return;
+    const lease=this.captureAccess(result.roomId);
     await this.room(result.roomId,async()=>{
+      if(!this.accessCurrent(lease))return;
       const thread=this.store.thread(result.threadId)!;
       if(thread.scheduledTask){
         const scheduledTask=thread.scheduledTask;
@@ -851,10 +1000,11 @@ export class Coordinator {
       const recentReplies=this.store.sentReplies(result.roomId,Math.min(this.config.recentMessageLimit,ROUTER_REPLY_HISTORY_LIMIT),currentTime);
       const threads=[thread,...this.store.routingThreads(result.roomId,this.config.threadCardLimit,this.config.threadIdleTtlMs,currentTime).filter(t=>t.id!==thread.id)].slice(0,this.config.threadCardLimit);
       const request:RouterRequest={roomId:result.roomId,currentTime,currentTimeContext:routerClock(currentTime,this.config.scheduledTasks?.defaultTimezone??'UTC'),event:result.deferrals?'timer':'worker_result',messages:[],recentMessages:this.store.recent(result.roomId,this.config.recentMessageLimit),recentReplies,threads,result:{id:result.id,threadId:thread.id,report:result.report,explicit:thread.explicit}};
-      if(this.persistentRouter){await this.routePersistentResult(result,request);return;}
+      if(this.persistentRouter){await this.routePersistentResult(result,request,lease);return;}
       let actions:RouteAction[];
-      try{actions=routeSchema.parse(await this.runtime.route(request));this.validateActions(actions,request);}
+      try{actions=routeSchema.parse(await this.executeRouter(request,undefined,undefined,lease));if(!this.accessCurrent(lease))return;this.validateActions(actions,request);}
       catch(e){
+        if(!this.accessCurrent(lease))return;
         this.error('result_router',e);
         if(modelRetriesExhausted(e)){
           if(this.stopped)return;
@@ -880,7 +1030,7 @@ export class Coordinator {
       });
     });
   }
-  private async routePersistentResult(result:ResultRow,request:RouterRequest){
+  private async routePersistentResult(result:ResultRow,request:RouterRequest,lease?:AccessLease){
     const manager=this.persistentRouter!;
     const databaseOptions={deadlineAt:Date.now()+(this.config.routerTurnTimeoutMs??120_000),stopped:()=>this.stopped};
     if(request.event==='timer')request.routeTriggerKey=`${result.id}:timer:${result.deferrals}:${result.dueAt}`;
@@ -898,8 +1048,9 @@ export class Coordinator {
         request=prepared.request;
         if(prepared.alreadyCommitted)return;
         await retrySqliteBusy(()=>manager.startAttempt(prepared!,2),databaseOptions);
-        actions=routeSchema.parse(await this.executeRouter(request,this.store.routerContextReader(result.roomId,undefined,request.currentTime),prepared));this.validateActions(actions,request);break;
+        actions=routeSchema.parse(await this.executeRouter(request,this.store.routerContextReader(result.roomId,undefined,request.currentTime),prepared,lease));this.validateActions(actions,request);break;
       }catch(error){
+        if(!this.accessCurrent(lease))return;
         if(isSqliteBusy(error))throw error;
         lastFailureCode=routerErrorCode(error);
         this.error('router_result_attempt',{resultId:result.id,attempt,code:lastFailureCode,causeCode:(error as {causeCode?:unknown})?.causeCode,error:String(error)});
@@ -910,7 +1061,7 @@ export class Coordinator {
         if(['ROUTER_RETRY_EXHAUSTED','ROUTER_DEADLINE','ROUTER_CALL_LIMIT','ROUTER_REBUILD_LIMIT','ROUTER_PROVIDER_UNAVAILABLE'].includes(code))break;
       }
     }
-    if(this.stopped)return;
+    if(this.stopped||!this.accessCurrent(lease))return;
     if(!actions){
       await retrySqliteBusy(()=>this.store.transaction(()=>{
         const thread=this.store.thread(result.threadId)!;
@@ -951,14 +1102,14 @@ export class Coordinator {
       // platform repeats this validation immediately before each upload.
       for(const [index,file] of files.entries()){
         const delivery=row.fileDeliveries[index];
-        if(delivery.status==='sent')continue;
+        if(delivery.status==='sent'||row.invalidatedParts?.includes(file.artifactId))continue;
         if(delivery.status==='unknown'||delivery.status==='sending')return {status:'unknown',reason:delivery.reason??'file_delivery_unknown'};
         try{await readOutgoingFile(file,join(this.config.stateDir,'workspaces'));}
         catch{delivery.status='failed';delivery.reason='invalid_output_file';this.store.saveOutbox(row);return {status:'failed',reason:'invalid_output_file'};}
       }
       for(const [index,file] of files.entries()){
         const delivery=row.fileDeliveries[index];
-        if(delivery.status==='sent')continue;
+        if(delivery.status==='sent'||row.invalidatedParts?.includes(file.artifactId))continue;
         if(this.stopped)return {status:'deferred',reason:'service_stopping'};
         if(!this.deliveryCurrent(row))return row.status==='sending'&&row.reason==='related_input_unresolved'?{status:'deferred',reason:row.reason}:undefined;
         delivery.status='sending';delivery.attempts++;delivery.attemptId=randomUUID();delete delivery.reason;
@@ -978,21 +1129,26 @@ export class Coordinator {
       if(!this.deliveryCurrent(row))return row.status==='sending'&&row.reason==='related_input_unresolved'?{status:'deferred',reason:row.reason}:undefined;
     }
     const {files:_,...message}=row.message;
-    if(files.length&&!message.text.trim()&&!message.attachments?.length&&!message.recipientIds?.length)return {status:'sent'};
-    return this.publisher.send(message,row.id);
+    if(row.invalidatedParts?.includes('message')||files.length&&!message.text.trim()&&!message.attachments?.length&&!message.recipientIds?.length){
+      if(row.invalidatedParts?.length){row.status='stale';row.reason='delivery_resolved';this.store.saveOutbox(row);this.deliveries.settle(row);return;}
+      return {status:'sent'};
+    }
+    row.messageDelivery={status:'sending'};this.store.saveOutbox(row);
+    const receipt=await this.publisher.send(message,row.id);row.messageDelivery={status:receipt.status,reason:receipt.reason,platformMessageId:receipt.platformMessageId};return receipt;
   }
   private enqueueFileDeliveryNotice(row:OutboxRow){
+    if(!this.roomAllowed(row.message.roomId))return;
     if(!row.message.files?.length||!['failed','unknown'].includes(row.status))return;
     const confirmed=row.fileDeliveries?.filter(file=>file.status==='sent').length??0;
     const outstanding=row.message.files.filter(file=>!row.fileDeliveries?.some(delivery=>delivery.artifactId===file.artifactId&&delivery.status==='sent'));
     const names=(files:typeof outstanding)=>files.map(file=>'「'+file.name+'」').join('、');
-    const detail=row.reason==='file_upload_unavailable'?'当前服务没有可用的群文件上传接口。':row.reason==='invalid_output_file'?'文件内容校验未通过。':'';
+    const detail=row.reason==='file_upload_unavailable'?'当前服务没有可用的文件上传接口。':row.reason==='invalid_output_file'?'文件内容校验未通过。':'';
     const uncertain=outstanding.filter(file=>row.fileDeliveries?.some(delivery=>delivery.artifactId===file.artifactId&&['unknown','sending'].includes(delivery.status)));
     const unattempted=outstanding.filter(file=>!uncertain.includes(file));
     const unknownText=uncertain.length?`${names(uncertain)}的上传结果尚未确认。${unattempted.length?names(unattempted)+'尚未上传。':''}`:`${names(outstanding)}尚未确认上传。`;
     const text=outstanding.length
-      ? `${confirmed?`已确认上传 ${confirmed} 个文件；`:''}${row.status==='unknown'?unknownText+'已停止自动重传，避免重复文件。':names(outstanding)+'未能上传到群，已停止本轮重试。'+detail}`
-      : '文件已上传到群，但配套回复'+(row.status==='unknown'?'的送达结果尚未确认，已停止自动重发。':'发送失败。');
+      ? `${confirmed?`已确认上传 ${confirmed} 个文件；`:''}${row.status==='unknown'?unknownText+'已停止自动重传，避免重复文件。':names(outstanding)+'未能上传到会话，已停止本轮重试。'+detail}`
+      : '文件已上传到会话，但配套回复'+(row.status==='unknown'?'的送达结果尚未确认，已停止自动重发。':'发送失败。');
     const thread=row.threadId?this.store.thread(row.threadId):undefined;
     this.store.enqueue({roomId:row.message.roomId,replyToMessageId:row.message.replyToMessageId,text:thread?this.scheduledTasks.title(thread,text):text,...(row.message.recipientIds?.length?{recipientIds:[...row.message.recipientIds]}:{})},
       {id:'file-delivery:'+row.id,fileDeliveryNoticeFor:row.id,threadId:row.threadId,revision:row.revision,epoch:row.epoch});
@@ -1004,7 +1160,7 @@ export class Coordinator {
       if(row.dueAt>Date.now())continue;
       if(!await this.prepareReplyPreferences(row,()=>this.registerSend(row)))continue;
       let receipt;
-      try{receipt=await this.deliverMessage(row);}catch{receipt={status:'unknown' as const,reason:'send raised after registration'};}
+      try{receipt=await this.deliverMessage(row);}catch{receipt={status:'unknown' as const,reason:'send raised after registration'};if(row.messageDelivery?.status==='sending')row.messageDelivery={status:'unknown',reason:receipt.reason};}
       if(!receipt){this.store.deliveryAttempt(row,'settled',{status:'deferred',reason:'stale_before_next_action'});continue;}
       row.status=receipt.status;
       if(receipt.status==='deferred'){
@@ -1026,13 +1182,36 @@ export class Coordinator {
         }
         this.store.saveOutbox(row);
         this.store.deliveryAttempt(row,'settled',receipt,'message',row.deliveryAttemptId,row.attempts+(receipt.status==='deferred'?1:0));
+        this.deliveries.settle(row);
         this.enqueueFileDeliveryNotice(row);
-        if(row.scheduleRunId)this.scheduledTasks.delivery(row.scheduleRunId,row.status);
-        if(this.persistentRouter&&this.store.routerSessions.session(row.message.roomId))this.store.routerSessions.appendEvent({roomId:row.message.roomId,sourceId:`delivery:${row.id}:${row.attempts}:${row.status}`,
+        if(row.scheduleRunId){this.scheduledTasks.delivery(row.scheduleRunId,row.status);if(receipt.reason==='friend_unavailable'){const run=this.scheduledTasks.service.getRun(row.scheduleRunId);if(run)this.scheduledTasks.service.block(run.scheduleId,'friend_unavailable');}}
+        if(this.roomAllowed(row.message.roomId)&&this.persistentRouter&&this.store.routerSessions.session(row.message.roomId))this.store.routerSessions.appendEvent({roomId:row.message.roomId,sourceId:`delivery:${row.id}:${row.attempts}:${row.status}`,
           payload:{kind:'delivery_changed',outboxId:row.id,status:row.status,...(row.platformMessageId?{platformMessageId:row.platformMessageId}:{})}});
       });
       if(receipt.status==='sent'){this.memoryWorker?.notify(row.message.roomId);this.memoryIngestion?.notify(row.message.roomId);}
     }}finally{this.dispatching=false;}
+  }
+  private roomAllowed(roomId:string){const room=parseQqRoomId(roomId);if(roomId.startsWith('qq:')&&!room)return false;return room?.kind!=='private'||this.privateAccess.allows(roomId);}
+  private captureAccess(roomId:string):AccessLease|undefined{return isPrivateRoom(roomId)?this.privateAccess.capture(roomId):undefined;}
+  private accessCurrent(lease?:AccessLease){return !lease||this.privateAccess.valid(lease);}
+  private refreshPrivatePolicy(force=false){
+    const rooms=new Set<string>();
+    for(const message of this.store.pendingMessages())rooms.add(message.roomId);
+    for(const thread of [...this.store.threadsInStatus('queued'),...this.store.threadsInStatus('running')])rooms.add(thread.roomId);
+    for(const result of this.store.results())rooms.add(result.roomId);
+    for(const row of this.store.outbox('pending'))rooms.add(row.message.roomId);
+    for(const row of this.store.db.prepare("SELECT room_id FROM schedules WHERE status IN ('active','paused','blocked') AND COALESCE(json_extract(data,'$.stateReason'),'')!='private_access_denied'").all())rooms.add(String(row.room_id));
+    this.privateAccess.poll(this.config.root,[...rooms],(revoked,settings,digest)=>{
+      this.store.transaction(()=>{
+        for(const room of revoked){this.store.revokePrivateRoom(room);this.scheduledTasks.service.revokeRoom(room);}
+        this.store.telemetry('private_config_applied',{digest,settings,startupDigest:qqStartupDigest(this.config.qq),revokedRooms:revoked,appliedAt:Date.now()});
+      });
+      for(const room of revoked){
+        this.friendRetryAt.delete(room);
+        const batch=this.batches.get(room);if(batch){if(batch.timer)clearTimeout(batch.timer);for(const item of batch.items.splice(0))item.resolve();if(!batch.running)this.batches.delete(room);}
+        for(const [id,active]of this.active)if(this.store.thread(id)?.roomId===room){active.abort.abort();void this.runtime.cancel(id).catch(error=>this.error('private_cancel',error));}
+      }
+    },code=>this.store.telemetry('private_config_error',{code}),force);
   }
   private safeError(error:unknown){return String(error).replace(/(?:sk-|Bearer\s+)[A-Za-z0-9_\-.]+/gi,'[redacted]').replaceAll(this.config.apiKey||'\0','[redacted]').slice(0,1200);}
   private taskError(error:unknown){this.error('schedule_operation',error);return '任务操作未完成：'+this.safeError(error instanceof Error?error.message:error);}
@@ -1068,5 +1247,6 @@ export class Coordinator {
     await this.runtime.close();await memoryClosing;await routerClosing;await ingestionClosing;
     await Promise.allSettled([...this.active.values()].map(x=>x.promise).concat([...this.roomLocks.values(),...this.resultTasks,...this.batchTasks,...this.steerTasks,this.dispatchTask].filter(Boolean) as Promise<void>[]));
     this.batches.clear();
+    await this.attachments.close();
   }
 }

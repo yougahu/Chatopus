@@ -14,6 +14,7 @@ export interface ImageDiagnostic {
   durationMs: number;
 }
 export interface ImageOptions {
+  signal?:AbortSignal;
   maxBytes?: number;
   timeoutMs?: number;
   /** Trusted bridge filesystem root, separate from our persistent received-image cache. */
@@ -88,11 +89,11 @@ export async function resolveOneBotImage(adapter: Pick<OneBotAdapter, 'call'>, a
   async function attempt<T>(stage: ImageDiagnostic['stage'], operation: () => Promise<T>): Promise<T | undefined> {
     const started = Date.now();
     try {
-      const result = await operation();
+      options.signal?.throwIfAborted();const result = await operation();options.signal?.throwIfAborted();
       record({ stage, status: 'success', durationMs: Date.now() - started, ...(Buffer.isBuffer(result) ? { bytes: result.length } : {}) });
       return result;
     } catch (error) {
-      lastError = error instanceof ImageError ? error : new ImageError(`${stage}_failed`, `Image ${stage} failed`);
+      options.signal?.throwIfAborted();lastError = error instanceof ImageError ? error : new ImageError(`${stage}_failed`, `Image ${stage} failed`);
       record({ stage, status: 'failed', code: lastError.code, ...(lastError.httpStatus === undefined ? {} : { httpStatus: lastError.httpStatus }), durationMs: Date.now() - started });
       return undefined;
     }
@@ -119,7 +120,7 @@ export async function resolveOneBotImage(adapter: Pick<OneBotAdapter, 'call'>, a
       const temporary = `${cacheFile}.${randomUUID()}.tmp`;
       try {
         await fs.writeFile(temporary, JSON.stringify({ version: 1, mimeType, sha256: digest(data), base64 }), { flag: 'wx', mode: 0o600 });
-        await fs.rename(temporary, cacheFile);
+        options.signal?.throwIfAborted();await fs.rename(temporary, cacheFile);
       } finally { await fs.rm(temporary, { force: true }); }
       return data;
     });
@@ -133,7 +134,7 @@ export async function resolveOneBotImage(adapter: Pick<OneBotAdapter, 'call'>, a
       let target: URL;
       try { target = new URL(url); } catch { throw new ImageError('untrusted_url', 'Untrusted image URL'); }
       if (target.protocol !== 'https:' || target.username || target.password || !qqHosts.has(target.hostname) || (target.port && target.port !== '443')) throw new ImageError('untrusted_url', 'Untrusted image URL');
-      const response = await fetch(target, { redirect: 'error', signal: AbortSignal.timeout(options.timeoutMs ?? 15000) });
+      const response = await fetch(target, { redirect: 'error', signal: AbortSignal.any([AbortSignal.timeout(options.timeoutMs ?? 15000),...(options.signal?[options.signal]:[])]) });
       if (!response.ok || !response.body) {
         await response.body?.cancel();
         throw new ImageError('http_error', 'Image download failed', response.status);

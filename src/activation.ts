@@ -1,7 +1,10 @@
+import {parseQqRoomId} from './conversation.js';
 import type { GroupMessage, RouteAction } from './types.js';
 
 /** A name is only a candidate: the Router must still distinguish calling from discussing the bot. */
 export function hasWakeCandidate(message:GroupMessage,names:readonly string[]):boolean {
+  const room=parseQqRoomId(message.roomId);
+  if(message.platform==='qq'&&room?.kind==='private'&&room.peerId===message.authorId)return true;
   if(message.isMentioned)return true;
   return names.some(name=>{
     const escaped=name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');

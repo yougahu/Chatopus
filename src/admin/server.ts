@@ -1,3 +1,7 @@
+import {Store} from '../store.js';
+import {ScheduledTaskService} from '../scheduled-tasks/service.js';
+import {DeliveryService,deliveryParts,deliveryClosed} from '../delivery-resolution.js';
+import {readPrivateSettings,savePrivateSettings} from './private-chat-config.js';
 import { createServer, type Server } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, realpathSync } from 'node:fs';
@@ -71,8 +75,8 @@ export class AdminServer {
   }
   private data(url:URL){
     if(url.pathname==='/api/config'){
-      const current=loadConfig(this.config.root,{stateDir:this.config.stateDir});
-      return safeConfig(current);
+      let current=this.config;try{current=loadConfig(this.config.root,{stateDir:this.config.stateDir});}catch{}
+      return {...safeConfig(current),privateChatStatus:readPrivateSettings(this.config)};
     }
     if(url.pathname==='/api/sources')return this.sources().map(({id,label})=>({id,label}));
     const source=this.sources().find(x=>x.id===(url.searchParams.get('source')??'main'));if(!source)throw new Error('Unknown source');
@@ -131,14 +135,16 @@ export class AdminServer {
       }
       const offset=Math.max(0,Math.min(1_000_000,Number(url.searchParams.get('offset'))||0));
       const room=url.searchParams.get('room')??'';const status=url.searchParams.get('status')??'';
+      const kind=url.searchParams.get('kind'),kindFilter=kind==='private'?" AND room GLOB 'qq:*:private:*'":kind==='group'?" AND room GLOB 'qq:*:*' AND room NOT GLOB 'qq:*:private:*'":'';
       if(url.pathname==='/api/threads'){
-        const threads=parseRows(db.prepare('SELECT * FROM threads WHERE (?=\'\' OR room=?) AND (?=\'\' OR status=?) ORDER BY updated DESC LIMIT 100 OFFSET ?').all(room,room,status,status,offset));
+        const limit=Math.max(1,Math.min(100,Math.floor(Number(url.searchParams.get('limit'))||100)));
+        const threads=parseRows(db.prepare('SELECT * FROM threads WHERE (?=\'\' OR room=?) AND (?=\'\' OR status=?) '+kindFilter+' ORDER BY updated DESC LIMIT ? OFFSET ?').all(room,room,status,status,limit,offset));
         const usage=readThreadTokenUsage(db,threads.map(thread=>String(thread.id)));
         return threads.map(thread=>({...thread,tokenUsage:usage.get(String(thread.id))}));
       }
-      if(url.pathname==='/api/messages')return parseRows(db.prepare('SELECT * FROM messages WHERE (?=\'\' OR room=?) AND (?=\'\' OR status=?) ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(room,room,status,status,offset));
+      if(url.pathname==='/api/messages')return parseRows(db.prepare('SELECT * FROM messages WHERE (?=\'\' OR room=?) AND (?=\'\' OR status=?) '+kindFilter+' ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(room,room,status,status,offset));
       if(url.pathname==='/api/decisions')return parseRows(db.prepare('SELECT * FROM decisions ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(offset));
-      if(url.pathname==='/api/outbox')return parseRows(db.prepare('SELECT * FROM outbox WHERE (?=\'\' OR status=?) ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(status,status,offset)).map(row=>({...row,deliveryEvents:parseRows(db.prepare("SELECT * FROM telemetry WHERE kind IN ('delivery_attempt_started','delivery_attempt_settled') AND json_extract(data,'$.outboxId')=? ORDER BY id DESC LIMIT 100").all(String(row.id))).reverse()}));
+      if(url.pathname==='/api/outbox')return parseRows(db.prepare('SELECT * FROM outbox WHERE (?=\'\' OR status=?) AND (?=\'\' OR room=?) '+kindFilter+' ORDER BY rowid DESC LIMIT 100 OFFSET ?').all(status,status,room,room,offset)).map(row=>({...row,deliveryParts:deliveryParts(row.data as any),deliveryClosed:deliveryClosed(row.data as any),deliveryEvents:parseRows(db.prepare("SELECT * FROM telemetry WHERE kind IN ('delivery_attempt_started','delivery_attempt_settled') AND json_extract(data,'$.outboxId')=? ORDER BY id DESC LIMIT 100").all(String(row.id))).reverse()}));
       if(url.pathname.startsWith('/api/threads/')){
         const id=decodeURIComponent(url.pathname.slice('/api/threads/'.length));
         return {thread:parseRows(db.prepare('SELECT * FROM threads WHERE id=?').all(id))[0],
@@ -194,6 +200,32 @@ export class AdminServer {
       if(!this.origins.has(origin)||(req.headers.origin&&!this.origins.has(req.headers.origin))){res.writeHead(403);res.end('Forbidden origin');return;}
       const url=new URL(req.url??'/',origin);
       if(url.pathname.startsWith('/api/')){
+        if(url.pathname==='/api/config'&&req.method==='POST'){
+          try{
+            let value:unknown;
+            {
+              if(!String(req.headers['content-type']??'').startsWith('application/json')){res.writeHead(415);res.end();return;}
+              let raw='';for await(const chunk of req){raw+=chunk.toString();if(Buffer.byteLength(raw)>64000)throw new Error('配置请求过大。');}
+              value=savePrivateSettings(this.config,JSON.parse(raw));
+            }
+            res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify(value));
+          }catch(error){res.writeHead((error as {status?:number}).status??400,{'Content-Type':'application/json'});res.end(JSON.stringify({error:error instanceof Error?error.message:'私聊配置无效。'}));}return;
+        }
+        if(url.pathname==='/api/deliveries/resolve'){
+          if(req.method!=='POST'){res.writeHead(405);res.end();return;}
+          if(url.searchParams.get('source')&&url.searchParams.get('source')!=='main'){res.writeHead(403);res.end();return;}
+          if(!String(req.headers['content-type']??'').startsWith('application/json')){res.writeHead(415);res.end();return;}
+          let store:Store|undefined;
+          try{
+            let raw='';for await(const chunk of req){raw+=chunk.toString();if(Buffer.byteLength(raw)>16000)throw new Error('投递操作请求过大。');}
+            const body=JSON.parse(raw);
+            if(!body||Object.keys(body).some(k=>!['outboxId','decision','partIds','expectedResolutionVersion','key'].includes(k))||typeof body.outboxId!=='string'||!['received','abandon'].includes(body.decision)||!Number.isSafeInteger(body.expectedResolutionVersion)||body.expectedResolutionVersion<0||typeof body.key!=='string'||!body.key||body.key.length>200||body.partIds!==undefined&&(!Array.isArray(body.partIds)||body.partIds.length>5||body.partIds.some((p:unknown)=>typeof p!=='string')))throw new Error('投递操作字段无效。');
+            store=new Store(join(this.config.stateDir,'state.sqlite'));const schedules=new ScheduledTaskService(store.db),deliveries=new DeliveryService(store,schedules,join(this.config.stateDir,'workspaces'));
+            schedules.deliveryOutstanding=id=>deliveries.outstanding(id);
+            const value=deliveries.resolve({kind:'admin',id:'local-admin'},body);
+            res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify(value));
+          }catch(error){res.writeHead(409,{'Content-Type':'application/json'});res.end(JSON.stringify({error:error instanceof Error?error.message:'投递结案失败。'}));}finally{store?.close();}return;
+        }
         if(this.schedules.handles(url.pathname)){
           if(!['GET','POST'].includes(req.method??'')){res.writeHead(405);res.end();return;}
           if(req.method==='POST'&&!String(req.headers['content-type']??'').startsWith('application/json')){res.writeHead(415);res.end();return;}
